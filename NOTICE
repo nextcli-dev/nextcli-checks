@@ -1,0 +1,14 @@
+NextCLI Checks
+Copyright 2026 NextCLI contributors
+
+This project is a community continuation of Checks, originally developed by
+Continue Dev, Inc. (https://github.com/continuedev/checks) and distributed
+under the Apache License, Version 2.0. The original copyright notice is
+retained in the LICENSE file.
+
+Changes in this distribution:
+
+- User-facing references were rebranded from Continue to NextCLI.
+- The repository is https://github.com/nextcli-dev/nextcli-checks.
+- The included GitHub Actions workflow runs checks through a provider-neutral
+  action, and it does not call Continue-hosted services.

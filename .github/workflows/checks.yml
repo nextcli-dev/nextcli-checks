@@ -1,0 +1,88 @@
+# Dogfood workflow for this repo. Other repositories should call the action
+# at nextcli-dev/nextcli-checks@v1. See the README for the provider inputs.
+#
+# The job is skipped until CHECKS_PROVIDER is set, and it is skipped on pull
+# requests from forks because those runs cannot read repository secrets.
+name: AI Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ai-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    if: vars.CHECKS_PROVIDER != '' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      checks: ${{ steps.list.outputs.checks }}
+      skip: ${{ steps.bot.outputs.skip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Skip commits from github-actions
+        id: bot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/skip-bot.sh
+
+      - name: List checks
+        id: list
+        env:
+          CHECKS_DIR: .checks
+          SKIP: ${{ steps.bot.outputs.skip }}
+        run: |
+          if [ "$SKIP" = "true" ]; then
+            echo 'checks=["skip"]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          count="$(python3 scripts/checks.py list --dir "$CHECKS_DIR" --lines | wc -l | tr -d ' ')"
+          if [ "$count" = "0" ]; then
+            echo 'checks=["skip"]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "checks<<EOF"
+            bash scripts/list-checks.sh
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: discover
+    if: needs.discover.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJson(needs.discover.outputs.checks || '["skip"]') }}
+    steps:
+      - name: Run check
+        if: needs.discover.outputs.skip != 'true' && matrix.check != 'skip'
+        uses: ./
+        with:
+          agent: ${{ vars.CHECKS_AGENT }}
+          provider: ${{ vars.CHECKS_PROVIDER }}
+          model: ${{ vars.CHECKS_MODEL }}
+          api-key: ${{ secrets.PROVIDER_API_KEY }}
+          base-url: ${{ vars.CHECKS_BASE_URL }}
+          check: ${{ matrix.check }}
+
+      - name: Nothing to run
+        if: needs.discover.outputs.skip == 'true' || matrix.check == 'skip'
+        run: echo "No checks to run."

@@ -1,0 +1,137 @@
+name: AI Checks
+description: Run .checks markdown files as a read-only agent on a pull request. The provider, model, API key, and base URL are inputs, so the workflow is not tied to one vendor.
+author: nextcli-dev
+
+branding:
+  icon: check-square
+  color: blue
+
+inputs:
+  agent:
+    description: Agent CLI that runs each check. opencode (default), nextcli, or claude-code. claude-code only supports anthropic, openrouter, and deepseek.
+    required: false
+    default: opencode
+  agent-version:
+    description: Version of the agent CLI to install. Defaults to opencode-ai 1.19.5 or @anthropic-ai/claude-code 2.1.312.
+    required: false
+    default: ""
+  provider:
+    description: Model provider. One of anthropic, openai, deepseek, openrouter, or openai-compatible (any OpenAI-compatible base URL, including oneprovider.dev).
+    required: true
+  model:
+    description: Model id, such as claude-sonnet-4-5 or deepseek-v4-pro. A check frontmatter value of provider/model overrides this for that check.
+    required: true
+  api-key:
+    description: Provider API key. Exposed to the agent only as PROVIDER_API_KEY.
+    required: true
+  base-url:
+    description: Provider base URL. Optional for named providers. Required for openai-compatible.
+    required: false
+    default: ""
+  timeout-per-check:
+    description: Minutes allowed for each check before it is reported as an error.
+    required: false
+    default: "10"
+  max-diff-bytes:
+    description: Maximum number of PR diff bytes passed to the agent.
+    required: false
+    default: "100000"
+  on-error:
+    description: Check-run conclusion when the agent output cannot be parsed. neutral (default) or failure.
+    required: false
+    default: neutral
+  check:
+    description: Run only this check (the file name without .md). Leave empty to run every check in the checks directory.
+    required: false
+    default: ""
+  checks-dir:
+    description: Directory of check markdown files, relative to the repository root.
+    required: false
+    default: .checks
+  nextcli-ref:
+    description: Git ref used to build the NextCLI CLI from source when agent is nextcli and cn is not already installed.
+    required: false
+    default: ""
+  nextcli-repository:
+    description: Git repository cloned when nextcli-ref is set.
+    required: false
+    default: https://github.com/nextcli-dev/nextcli.git
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+
+    - name: Skip commits from github-actions
+      id: bot
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/skip-bot.sh"
+
+    - name: Setup Node
+      if: steps.bot.outputs.skip != 'true'
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 22
+
+    - name: Cache agent package downloads
+      if: steps.bot.outputs.skip != 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.npm
+        key: checks-agent-${{ inputs.agent }}-${{ inputs.agent-version || 'default' }}-${{ runner.os }}
+
+    - name: Install agent CLI
+      if: steps.bot.outputs.skip != 'true'
+      shell: bash
+      env:
+        CHECKS_AGENT: ${{ inputs.agent }}
+        CHECKS_AGENT_VERSION: ${{ inputs.agent-version }}
+        CHECKS_NEXTCLI_REF: ${{ inputs.nextcli-ref }}
+        CHECKS_NEXTCLI_REPOSITORY: ${{ inputs.nextcli-repository }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/install-agent.sh"
+
+    - name: Fetch the pull request diff
+      if: steps.bot.outputs.skip != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        CHECKS_MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/prepare-diff.sh"
+
+    - name: Run checks
+      if: steps.bot.outputs.skip != 'true'
+      shell: bash
+      env:
+        CHECKS_AGENT: ${{ inputs.agent }}
+        CHECKS_PROVIDER: ${{ inputs.provider }}
+        CHECKS_MODEL: ${{ inputs.model }}
+        PROVIDER_API_KEY: ${{ inputs.api-key }}
+        CHECKS_BASE_URL: ${{ inputs.base-url }}
+        CHECKS_TIMEOUT: ${{ inputs.timeout-per-check }}
+        CHECKS_ON_ERROR: ${{ inputs.on-error }}
+        CHECKS_ONLY: ${{ inputs.check }}
+        CHECKS_DIR: ${{ inputs.checks-dir }}
+        GH_TOKEN: ${{ github.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/run-checks.sh"
+
+    - name: Upload check outputs
+      if: always() && steps.bot.outputs.skip != 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: check-results${{ inputs.check != '' && format('-{0}', inputs.check) || '' }}
+        path: /tmp/check-*.json
+        retention-days: 7
+        if-no-files-found: ignore
