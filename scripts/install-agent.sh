@@ -40,7 +40,7 @@ case "$agent" in
       export PATH="${install_dir}:${PATH}"
       cn --version
     else
-      if ! npm install -g @continuedev/cli; then
+      if ! npm install -g @nextcli/cli; then
         echo "The NextCLI CLI is not published to npm yet. Pass nextcli-ref to build it from source, or set agent to opencode." >&2
         exit 1
       fi
