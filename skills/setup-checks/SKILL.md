@@ -233,11 +233,11 @@ jobs:
           base-url: ${{ vars.CHECKS_BASE_URL }}
 ```
 
-When the agent is not `opencode`, add `agent: ${{ vars.CHECKS_AGENT }}` under `with:`.
+When the agent is not `opencode`, add `agent: ${{ vars.CHECKS_AGENT }}` under `with:`. For `nextcli`, also add `nextcli-ref: main` until `@nextcli/cli` is published to npm. The action then builds `cn` from source, which adds several minutes to each job.
 
 The action installs the agent, runs each file in `.checks/` as a read-only agent, and posts one GitHub check run per file. A passing check is silent. A failing check opens a review with committable suggestion comments. Fork pull requests are skipped because they cannot read repository secrets.
 
-To run one job per check instead of one job for all of them, copy the matrix workflow from [nextcli-dev/nextcli-checks](https://github.com/nextcli-dev/nextcli-checks/blob/main/.github/workflows/checks.yml). Pass `check` set to the matrix value.
+To run one job per check instead of one job for all of them, copy the matrix workflow from [nextcli-dev/nextcli-checks](https://github.com/nextcli-dev/nextcli-checks/blob/master/.github/workflows/checks.yml). Pass `check` set to the matrix value.
 
 Tell the user to run the following in their terminal. Fill in `<owner>/<repo>` and the values they chose. **Do not run the secret command yourself. Do not put the API key in the command, in the workflow, or in chat.**
 
@@ -295,5 +295,6 @@ Mark task 4 complete. Share the pull request URL.
 | `git rev-parse` fails | This directory is not a git repository | Stop. Ask the user to run this inside a clone. |
 | `gh` is not found or not logged in | The GitHub CLI is missing or has no token | Skip review history and print the CI commands for the user to run later. |
 | The user picks `claude-code` with `openai` or `openai-compatible` | That agent only speaks the Anthropic API | Ask them to pick `opencode` or `nextcli`, or to switch the provider to `anthropic`, `openrouter`, or `deepseek`. |
+| `The NextCLI CLI is not published to npm yet` or `cn is not on PATH` | The `nextcli` agent installs `@nextcli/cli` from npm, which is not published yet | Add `nextcli-ref: main` under `with:` so the action builds `cn` from source, or switch the agent to `opencode`. |
 | CI does not run after merge | `CHECKS_PROVIDER` or `PROVIDER_API_KEY` was never set | Have the user run the `gh variable set` and `gh secret set` commands from Step 5. |
 | A check fails on code the pull request did not touch | The check has no `paths` filter, or the prompt is too broad | Add `paths` or an early-exit line to the check file. |

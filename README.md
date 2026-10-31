@@ -115,6 +115,32 @@ gh secret set PROVIDER_API_KEY --repo owner/repo
 
 Leave `base-url` empty for a named provider unless you need a gateway. Set `CHECKS_AGENT` and pass `agent: ${{ vars.CHECKS_AGENT }}` only when you are not using the default `opencode`.
 
+### Agent inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `agent` | `opencode` | Agent CLI that runs each check: `opencode`, `nextcli`, or `claude-code`. |
+| `agent-version` | empty | Version of `opencode-ai` or `@anthropic-ai/claude-code` to install. It does not pin the `nextcli` agent yet. |
+| `nextcli-ref` | empty | Branch or tag of NextCLI to build from source when `agent` is `nextcli` and `cn` is not already installed. Commit SHAs are not supported. |
+| `nextcli-repository` | `https://github.com/nextcli-dev/nextcli.git` | Repository cloned when `nextcli-ref` is set. |
+| `timeout-per-check` | `10` | Minutes allowed for each check before it is reported as an error. |
+| `max-diff-bytes` | `100000` | Maximum number of PR diff bytes passed to the agent. |
+| `on-error` | `neutral` | Check-run conclusion when the agent output cannot be parsed: `neutral` or `failure`. |
+| `check` | empty | Run only this check (the file name without `.md`). |
+| `checks-dir` | `.checks` | Directory of check markdown files, relative to the repository root. |
+
+Until `@nextcli/cli` is published to npm, the `nextcli` agent needs `nextcli-ref` so the action can build `cn` from source. The build adds several minutes to each job:
+
+```yaml
+      - uses: nextcli-dev/nextcli-checks@v1
+        with:
+          agent: nextcli
+          nextcli-ref: main
+          provider: ${{ vars.CHECKS_PROVIDER }}
+          model: ${{ vars.CHECKS_MODEL }}
+          api-key: ${{ secrets.PROVIDER_API_KEY }}
+```
+
 The [workflow in this repository](./.github/workflows/checks.yml) runs one job per check, with the agent install cached. Fork pull requests are skipped because they cannot read repository secrets. A check can set `model: provider/model` to override the model, and `paths` so it is reported as success without calling the model when no changed file matches.
 
 Add `PROVIDER_API_KEY` under GitHub Settings > Secrets and variables > Actions. The provider, model, and base URL belong under Variables, not Secrets.

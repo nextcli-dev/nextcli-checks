@@ -321,7 +321,7 @@ You need five things:
 
 The runner is the composite action in [`action.yml`](./action.yml). A caller passes `provider`, `model`, `api-key` (the `PROVIDER_API_KEY` secret), and an optional `base-url`. Named providers are `anthropic`, `openai`, `deepseek`, and `openrouter`. `openai-compatible` is any OpenAI-compatible gateway (oneprovider.dev, LiteLLM, vLLM) and requires `base-url`.
 
-`agent` defaults to opencode. `nextcli` writes a temporary Continue config and runs `cn` in read-only mode. `claude-code` only supports Anthropic-compatible endpoints (`anthropic`, `openrouter`, and `deepseek`) and fails that check with a clear error for any other provider.
+`agent` defaults to opencode. `nextcli` writes a temporary NextCLI `config.yaml` (see `scripts/agents/nextcli.sh`) and runs `cn -p --readonly --config <file>`. `claude-code` only supports Anthropic-compatible endpoints (`anthropic`, `openrouter`, and `deepseek`) and fails that check with a clear error for any other provider.
 
 The workflow in [`.github/workflows/checks.yml`](./.github/workflows/checks.yml) is the parallel form: one job per check file, with the agent install cached. A one-step workflow that runs every check in a single job is in the README. Both post individual status checks and committable suggestion comments when a check fails.
 
