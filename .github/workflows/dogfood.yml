@@ -1,0 +1,30 @@
+# Runs this repository's own .checks on its pull requests, through the
+# released reusable workflow. Changes to the scripts are covered by ci.yml.
+name: Dogfood
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: dogfood-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ai-checks:
+    if: vars.CHECKS_PROVIDER != '' && github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/checks.yml
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    with:
+      agent: ${{ vars.CHECKS_AGENT || 'opencode' }}
+      provider: ${{ vars.CHECKS_PROVIDER }}
+      model: ${{ vars.CHECKS_MODEL }}
+      base-url: ${{ vars.CHECKS_BASE_URL }}
+    secrets:
+      api-key: ${{ secrets.PROVIDER_API_KEY }}

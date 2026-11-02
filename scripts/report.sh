@@ -22,9 +22,10 @@ suggestion_count="$(python3 -c 'import json,sys; print(len(json.load(open(sys.ar
 
 details_url=""
 
-if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${PR_NUMBER:-}" ] && [ "$verdict" != "PASS" ] && [ "$verdict" != "SKIP" ]; then
-  # Drop the review this check posted on the previous run so suggestion
-  # threads do not pile up. Dismiss fails closed when the token cannot.
+if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${PR_NUMBER:-}" ]; then
+  # Dismiss the review this check posted on a previous run, whatever the new
+  # verdict is. A FAIL that turns into a PASS must not leave its "changes
+  # requested" review blocking the pull request.
   review_ids="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
     --jq ".[] | select(.body != null) | select(.body | startswith(\"## check/${name}\")) | .id" 2>/dev/null || true)"
   if [ -n "$review_ids" ]; then
@@ -35,7 +36,9 @@ if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${PR_NUMBER:-}" ] && [ "$verdict" !=
         -f event="DISMISS" >/dev/null 2>&1 || true
     done <<< "$review_ids"
   fi
+fi
 
+if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${PR_NUMBER:-}" ] && [ "$verdict" != "PASS" ] && [ "$verdict" != "SKIP" ]; then
   if [ "$suggestion_count" -gt 0 ] && [ -n "${HEAD_SHA:-}" ]; then
     payload="$(mktemp)"
     python3 "$script_dir/checks.py" review-payload --name "$name" --sha "$HEAD_SHA" --verdict "$verdict_file" > "$payload"
@@ -65,6 +68,7 @@ if [ -n "$check_run_id" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
     --verdict "$verdict_file" > "$patch"
   gh api -X PATCH "repos/${GITHUB_REPOSITORY}/check-runs/${check_run_id}" --input "$patch" >/dev/null
   rm -f "$patch"
+  echo "$check_run_id" >> /tmp/check-runs-done.txt
 fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then

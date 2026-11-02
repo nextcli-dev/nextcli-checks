@@ -326,5 +326,35 @@ class InstallAgentTest(unittest.TestCase):
         self.assertTrue((self.home / ".local" / "bin" / "cn").is_symlink())
 
 
+
+class RedactTest(unittest.TestCase):
+    def test_redacts_every_occurrence(self):
+        text = 'reason: key sk-abcdef123456 leaked; again sk-abcdef123456'
+        self.assertEqual(
+            checks.redact_text(text, ["sk-abcdef123456"]),
+            "reason: key [REDACTED] leaked; again [REDACTED]",
+        )
+
+    def test_ignores_empty_and_short_values(self):
+        self.assertEqual(checks.redact_text("abc 1234", ["", "1234"]), "abc 1234")
+
+    def test_longest_secret_first(self):
+        self.assertEqual(
+            checks.redact_text("tok=ghs_longtoken123", ["ghs_long", "ghs_longtoken123"]),
+            "tok=[REDACTED]",
+        )
+
+    def test_redact_command_rewrites_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verdict = Path(tmp) / "verdict.json"
+            verdict.write_text(json.dumps({"verdict": "FAIL", "reason": "sk-secretvalue99"}))
+            env = {**__import__("os").environ, "PROVIDER_API_KEY": "sk-secretvalue99"}
+            subprocess.run(
+                ["python3", "-I", str(MODULE_PATH), "redact", str(verdict), str(Path(tmp) / "missing")],
+                check=True,
+                env=env,
+            )
+            self.assertEqual(json.loads(verdict.read_text())["reason"], "[REDACTED]")
+
 if __name__ == "__main__":
     unittest.main()

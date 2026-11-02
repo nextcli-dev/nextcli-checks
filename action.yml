@@ -1,5 +1,5 @@
 name: AI Checks
-description: Run .checks markdown files as a read-only agent on a pull request. The provider, model, API key, and base URL are inputs, so the workflow is not tied to one vendor.
+description: Run .checks markdown files as a read-only agent on a pull request. The provider, model, API key, and base URL are inputs, so the workflow is not tied to one vendor. Check definitions are read from the pull request's base commit, so a pull request cannot change the checks that review it.
 author: nextcli-dev
 
 branding:
@@ -7,6 +7,14 @@ branding:
   color: blue
 
 inputs:
+  mode:
+    description: run (default) runs checks and reports them. list only outputs the JSON array of check names in `checks`, for a matrix.
+    required: false
+    default: run
+  pr-number:
+    description: Pull request number. Defaults to the pull request of the triggering event. Set it when the workflow is not triggered by a pull_request event, for example workflow_dispatch.
+    required: false
+    default: ""
   agent:
     description: Agent CLI that runs each check. opencode (default), nextcli, or claude-code. claude-code only supports anthropic, openrouter, and deepseek.
     required: false
@@ -16,14 +24,17 @@ inputs:
     required: false
     default: ""
   provider:
-    description: Model provider. One of anthropic, openai, deepseek, openrouter, or openai-compatible (any OpenAI-compatible base URL, including oneprovider.dev).
-    required: true
+    description: Model provider. One of anthropic, openai, deepseek, openrouter, or openai-compatible (any OpenAI-compatible base URL, including oneprovider.dev). Required in run mode.
+    required: false
+    default: ""
   model:
-    description: Model id, such as claude-sonnet-4-5 or deepseek-v4-pro. A check frontmatter value of provider/model overrides this for that check.
-    required: true
+    description: Model id, such as claude-sonnet-4-5 or deepseek-v4-pro. A check frontmatter value of provider/model overrides this for that check. Required in run mode.
+    required: false
+    default: ""
   api-key:
-    description: Provider API key. Exposed to the agent only as PROVIDER_API_KEY.
-    required: true
+    description: Provider API key. Exposed to the agent only as PROVIDER_API_KEY, and removed from everything posted or uploaded. Not needed in list mode.
+    required: false
+    default: ""
   base-url:
     description: Provider base URL. Optional for named providers. Required for openai-compatible.
     required: false
@@ -45,7 +56,7 @@ inputs:
     required: false
     default: ""
   checks-dir:
-    description: Directory of check markdown files, relative to the repository root.
+    description: Directory of check markdown files, relative to the repository root. Read from the pull request's base commit.
     required: false
     default: .checks
   nextcli-ref:
@@ -57,38 +68,99 @@ inputs:
     required: false
     default: https://github.com/nextcli-dev/nextcli.git
 
+outputs:
+  checks:
+    description: In list mode, the JSON array of check names (file names without .md) in checks-dir at the base commit.
+    value: ${{ steps.list.outputs.checks }}
+
 runs:
   using: composite
   steps:
-    - name: Checkout
+    - name: Resolve the pull request
+      id: pr
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        PR_INPUT: ${{ inputs.pr-number }}
+        EVENT_PR: ${{ github.event.pull_request.number }}
+        MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        case "$MODE" in
+          run|list) ;;
+          *) echo "::error::mode must be run or list (got '$MODE')."; exit 1 ;;
+        esac
+        number="${PR_INPUT:-$EVENT_PR}"
+        if [ -z "$number" ]; then
+          echo "::error::No pull request. Set pr-number when the workflow is not triggered by a pull request."
+          exit 1
+        fi
+        gh api "repos/${GH_REPO}/pulls/${number}" > "$RUNNER_TEMP/pr.json"
+        {
+          echo "number=${number}"
+          echo "base_sha=$(jq -r .base.sha "$RUNNER_TEMP/pr.json")"
+          echo "head_sha=$(jq -r .head.sha "$RUNNER_TEMP/pr.json")"
+        } >> "$GITHUB_OUTPUT"
+
+    # The agent reads the pull request's code. Blobs are fetched on demand and
+    # credentials are not kept in .git/config.
+    - name: Checkout the pull request
+      if: inputs.mode == 'run'
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
+        ref: refs/pull/${{ steps.pr.outputs.number }}/head
         fetch-depth: 0
+        filter: blob:none
+        persist-credentials: false
+
+    # Check definitions come from the base commit, so the pull request under
+    # review cannot edit or delete them.
+    - name: Checkout the checks from the base commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ steps.pr.outputs.base_sha }}
+        path: .nextcli-checks-base
+        sparse-checkout: ${{ inputs.checks-dir }}
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: List checks
+      id: list
+      if: inputs.mode == 'list'
+      shell: bash
+      env:
+        CHECKS_DIR: ${{ github.workspace }}/.nextcli-checks-base/${{ inputs.checks-dir }}
+      run: |
+        checks="$(python3 "$GITHUB_ACTION_PATH/scripts/checks.py" list --dir "$CHECKS_DIR")"
+        echo "checks=${checks}" >> "$GITHUB_OUTPUT"
+        echo "Checks: ${checks}"
 
     - name: Skip commits from github-actions
       id: bot
+      if: inputs.mode == 'run'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
       run: bash "$GITHUB_ACTION_PATH/scripts/skip-bot.sh"
 
     - name: Setup Node
-      if: steps.bot.outputs.skip != 'true'
+      if: inputs.mode == 'run' && steps.bot.outputs.skip != 'true'
       uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: 22
 
     - name: Cache agent package downloads
-      if: steps.bot.outputs.skip != 'true'
+      if: inputs.mode == 'run' && steps.bot.outputs.skip != 'true'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.npm
         key: checks-agent-${{ inputs.agent }}-${{ inputs.agent-version || 'default' }}-${{ inputs.nextcli-ref || 'npm' }}-${{ runner.os }}
 
     - name: Install agent CLI
-      if: steps.bot.outputs.skip != 'true'
+      if: inputs.mode == 'run' && steps.bot.outputs.skip != 'true'
       shell: bash
       env:
         CHECKS_AGENT: ${{ inputs.agent }}
@@ -98,18 +170,17 @@ runs:
       run: bash "$GITHUB_ACTION_PATH/scripts/install-agent.sh"
 
     - name: Fetch the pull request diff
-      if: steps.bot.outputs.skip != 'true'
+      if: inputs.mode == 'run' && steps.bot.outputs.skip != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        GH_REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
         CHECKS_MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
       run: bash "$GITHUB_ACTION_PATH/scripts/prepare-diff.sh"
 
     - name: Run checks
-      if: steps.bot.outputs.skip != 'true'
+      if: inputs.mode == 'run'
       shell: bash
       env:
         CHECKS_AGENT: ${{ inputs.agent }}
@@ -120,15 +191,33 @@ runs:
         CHECKS_TIMEOUT: ${{ inputs.timeout-per-check }}
         CHECKS_ON_ERROR: ${{ inputs.on-error }}
         CHECKS_ONLY: ${{ inputs.check }}
-        CHECKS_DIR: ${{ inputs.checks-dir }}
+        CHECKS_DIR: ${{ github.workspace }}/.nextcli-checks-base/${{ inputs.checks-dir }}
+        CHECKS_SKIP_REASON: ${{ steps.bot.outputs.skip == 'true' && 'The head commit was made by github-actions[bot].' || '' }}
         GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
         GITHUB_REPOSITORY: ${{ github.repository }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
       run: bash "$GITHUB_ACTION_PATH/scripts/run-checks.sh"
 
+    - name: Close unfinished check runs
+      if: always() && inputs.mode == 'run'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/close-check-runs.sh"
+
+    - name: Remove secrets from check outputs
+      if: always() && inputs.mode == 'run'
+      shell: bash
+      env:
+        PROVIDER_API_KEY: ${{ inputs.api-key }}
+        GH_TOKEN: ${{ github.token }}
+      run: python3 "$GITHUB_ACTION_PATH/scripts/checks.py" redact /tmp/check-*.json
+
     - name: Upload check outputs
-      if: always() && steps.bot.outputs.skip != 'true'
+      if: always() && inputs.mode == 'run' && steps.bot.outputs.skip != 'true'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: check-results${{ inputs.check != '' && format('-{0}', inputs.check) || '' }}

@@ -405,6 +405,23 @@ def conclusion_for(verdict: str, on_error: str) -> str:
     return "neutral"
 
 
+# Environment variables whose values must never appear in anything posted to
+# the pull request or uploaded as an artifact.
+SECRET_ENV_VARS = ("PROVIDER_API_KEY", "GH_TOKEN", "GITHUB_TOKEN")
+REDACTED = "[REDACTED]"
+
+
+def redact_text(text: str, secrets: list[str]) -> str:
+    # Longest first, so a secret that contains another is replaced whole.
+    for secret in sorted({s for s in secrets if len(s) >= 8}, key=len, reverse=True):
+        text = text.replace(secret, REDACTED)
+    return text
+
+
+def secrets_from_env() -> list[str]:
+    return [os.environ.get(name, "") for name in SECRET_ENV_VARS]
+
+
 def _env(name: str) -> str:
     value = os.environ.get(name, "")
     if not value:
@@ -518,6 +535,19 @@ def cmd_check_run_body(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_redact(args: argparse.Namespace) -> int:
+    secrets = secrets_from_env()
+    for name in args.files:
+        path = Path(name)
+        if not path.is_file():
+            continue
+        text = path.read_text(errors="replace")
+        cleaned = redact_text(text, secrets)
+        if cleaned != text:
+            path.write_text(cleaned)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AI check helpers")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -559,6 +589,13 @@ def build_parser() -> argparse.ArgumentParser:
     check_run.add_argument("--details-url", default="")
     check_run.add_argument("--verdict")
     check_run.set_defaults(func=cmd_check_run_body)
+
+    redact = sub.add_parser(
+        "redact",
+        help="Replace secret values from the environment in the given files, in place.",
+    )
+    redact.add_argument("files", nargs="*")
+    redact.set_defaults(func=cmd_redact)
     return parser
 
 

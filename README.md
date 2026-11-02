@@ -69,9 +69,7 @@ Before opening a pull request, run all checks in `.checks/` against the current 
 
 ## Run in CI
 
-The [composite action](./action.yml) runs every check on a pull request. Results appear as individual GitHub status checks. Passing checks complete silently. Failing checks post committable suggestion comments. The agent is read-only: it can read files and run a short list of read-only commands, and it cannot edit the checkout.
-
-The action is not tied to one vendor. You pass a provider, a model, an API key, and an optional base URL. `agent` defaults to [opencode](https://opencode.ai). `nextcli` uses the NextCLI `cn` CLI. `claude-code` only supports Anthropic-compatible endpoints (`anthropic`, `openrouter`, and `deepseek`).
+Call the reusable workflow. It lists the checks, then runs each one as its own job, in parallel. Each check reports as a check run named `check/<name>`. Passing checks complete silently. Failing checks post committable suggestion comments. The agent is read-only: it can read files and run a short list of read-only commands, and it cannot edit the checkout.
 
 ```yaml
 name: AI Checks
@@ -79,22 +77,47 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 jobs:
-  checks:
-    if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  ai-checks:
+    uses: nextcli-dev/nextcli-checks/.github/workflows/checks.yml@v2
     permissions:
       contents: read
       pull-requests: write
       checks: write
-    steps:
-      - uses: nextcli-dev/nextcli-checks@v1
-        with:
-          provider: ${{ vars.CHECKS_PROVIDER }}
-          model: ${{ vars.CHECKS_MODEL }}
-          api-key: ${{ secrets.PROVIDER_API_KEY }}
-          base-url: ${{ vars.CHECKS_BASE_URL }}
+    with:
+      provider: ${{ vars.CHECKS_PROVIDER }}
+      model: ${{ vars.CHECKS_MODEL }}
+      base-url: ${{ vars.CHECKS_BASE_URL }}
+    secrets:
+      api-key: ${{ secrets.PROVIDER_API_KEY }}
 ```
+
+To run checks on demand instead, trigger on a label and pass the pull request number for manual runs:
+
+```yaml
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+jobs:
+  ai-checks:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'ai-review'
+    uses: nextcli-dev/nextcli-checks/.github/workflows/checks.yml@v2
+    # permissions, with and secrets as above, plus:
+    #   pr-number: ${{ inputs.pr }}
+```
+
+How it runs:
+
+- Check definitions are read from the pull request's **base** commit. A pull request cannot change or delete the checks that review it, and a pull request that adds `.checks/` gets checked only after it merges.
+- Pull requests from forks get no repository secrets, so the checks are skipped. `workflow_dispatch` with `pr-number` runs them on a fork's code with your secrets, so only do that for code you have read.
+- The agent's environment has the provider key and no GitHub or Actions tokens. The key and the GitHub token are removed from everything posted to the pull request or uploaded as an artifact.
+- A check run left unfinished by a cancelled or timed-out job is completed as `neutral`. Re-running a check dismisses its previous review, so a fixed failure stops requesting changes.
+
+The workflow is not tied to one vendor. You pass a provider, a model, an API key, and an optional base URL. `agent` defaults to [opencode](https://opencode.ai). `nextcli` uses the NextCLI `cn` CLI. `claude-code` only supports Anthropic-compatible endpoints (`anthropic`, `openrouter`, and `deepseek`).
 
 | Provider | `provider` | `base-url` |
 | --- | --- | --- |
@@ -115,7 +138,9 @@ gh secret set PROVIDER_API_KEY --repo owner/repo
 
 Leave `base-url` empty for a named provider unless you need a gateway. Set `CHECKS_AGENT` and pass `agent: ${{ vars.CHECKS_AGENT }}` only when you are not using the default `opencode`.
 
-### Agent inputs
+### Inputs
+
+The reusable workflow takes `provider`, `model`, `agent`, `base-url`, `checks-dir`, `pr-number`, `timeout-per-check` and `on-error`, and the `api-key` secret. To use any other input below, call the action directly, `nextcli-dev/nextcli-checks@v2`, in your own job. The action runs every check in one job, or one check with `check`; with `mode: list` it only outputs the check names as a JSON array, for your own matrix.
 
 | Input | Default | Description |
 | --- | --- | --- |
@@ -127,12 +152,14 @@ Leave `base-url` empty for a named provider unless you need a gateway. Set `CHEC
 | `max-diff-bytes` | `100000` | Maximum number of PR diff bytes passed to the agent. |
 | `on-error` | `neutral` | Check-run conclusion when the agent output cannot be parsed: `neutral` or `failure`. |
 | `check` | empty | Run only this check (the file name without `.md`). |
-| `checks-dir` | `.checks` | Directory of check markdown files, relative to the repository root. |
+| `checks-dir` | `.checks` | Directory of check markdown files, relative to the repository root, read from the base commit. |
+| `pr-number` | event's PR | Pull request to check. Required when the workflow is not triggered by a pull request. |
+| `mode` | `run` | `run` runs and reports checks. `list` only sets the `checks` output. |
 
 The `nextcli` agent installs `@nextcli/cli` from npm, pinned to `agent-version`. To run unreleased NextCLI code instead, set `nextcli-ref` and the action builds `cn` from source. The build adds several minutes to each job:
 
 ```yaml
-      - uses: nextcli-dev/nextcli-checks@v1
+      - uses: nextcli-dev/nextcli-checks@v2
         with:
           agent: nextcli
           nextcli-ref: main   # optional: a branch, tag, or commit SHA
@@ -141,7 +168,7 @@ The `nextcli` agent installs `@nextcli/cli` from npm, pinned to `agent-version`.
           api-key: ${{ secrets.PROVIDER_API_KEY }}
 ```
 
-The [workflow in this repository](./.github/workflows/checks.yml) runs one job per check, with the agent install cached. Fork pull requests are skipped because they cannot read repository secrets. A check can set `model: provider/model` to override the model, and `paths` so it is reported as success without calling the model when no changed file matches.
+A check can set `model: provider/model` to override the model, and `paths` so it is reported as success without calling the model when no changed file matches.
 
 Add `PROVIDER_API_KEY` under GitHub Settings > Secrets and variables > Actions. The provider, model, and base URL belong under Variables, not Secrets.
 

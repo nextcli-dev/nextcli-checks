@@ -216,28 +216,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
-    if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  ai-checks:
+    uses: nextcli-dev/nextcli-checks/.github/workflows/checks.yml@v2
     permissions:
       contents: read
       pull-requests: write
       checks: write
-    steps:
-      - uses: nextcli-dev/nextcli-checks@v1
-        with:
-          provider: ${{ vars.CHECKS_PROVIDER }}
-          model: ${{ vars.CHECKS_MODEL }}
-          api-key: ${{ secrets.PROVIDER_API_KEY }}
-          base-url: ${{ vars.CHECKS_BASE_URL }}
+    with:
+      provider: ${{ vars.CHECKS_PROVIDER }}
+      model: ${{ vars.CHECKS_MODEL }}
+      base-url: ${{ vars.CHECKS_BASE_URL }}
+    secrets:
+      api-key: ${{ secrets.PROVIDER_API_KEY }}
 ```
 
-When the agent is not `opencode`, add `agent: ${{ vars.CHECKS_AGENT }}` under `with:`. For `nextcli`, the action installs `@nextcli/cli` from npm; add `agent-version` only to pin a version other than the default.
+When the agent is not `opencode`, add `agent: ${{ vars.CHECKS_AGENT }}` under `with:`.
 
-The action installs the agent, runs each file in `.checks/` as a read-only agent, and posts one GitHub check run per file. A passing check is silent. A failing check opens a review with committable suggestion comments. Fork pull requests are skipped because they cannot read repository secrets.
-
-To run one job per check instead of one job for all of them, copy the matrix workflow from [nextcli-dev/nextcli-checks](https://github.com/nextcli-dev/nextcli-checks/blob/master/.github/workflows/checks.yml). Pass `check` set to the matrix value.
+The workflow runs each file in `.checks/` as its own parallel job with a read-only agent, and posts one GitHub check run per file. A passing check is silent. A failing check opens a review with committable suggestion comments. Fork pull requests are skipped because they cannot read repository secrets. Checks are read from the pull request's base commit, so the new `.checks/` files only run on pull requests opened after they are merged.
 
 Tell the user to run the following in their terminal. Fill in `<owner>/<repo>` and the values they chose. **Do not run the secret command yourself. Do not put the API key in the command, in the workflow, or in chat.**
 

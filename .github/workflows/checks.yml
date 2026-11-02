@@ -1,68 +1,109 @@
-# Dogfood workflow for this repo. Other repositories should call the action
-# at nextcli-dev/nextcli-checks@v1. See the README for the provider inputs.
+# Reusable workflow: runs every check in checks-dir on one pull request, one
+# job per check, in parallel. Each check reports as its own check run,
+# `check/<name>`.
 #
-# The job is skipped until CHECKS_PROVIDER is set, and it is skipped on pull
-# requests from forks because those runs cannot read repository secrets.
+#   jobs:
+#     ai-checks:
+#       uses: nextcli-dev/nextcli-checks/.github/workflows/checks.yml@v2
+#       permissions:
+#         contents: read
+#         pull-requests: write
+#         checks: write
+#       with:
+#         provider: ${{ vars.CHECKS_PROVIDER }}
+#         model: ${{ vars.CHECKS_MODEL }}
+#       secrets:
+#         api-key: ${{ secrets.PROVIDER_API_KEY }}
+#
+# The jobs below use nextcli-dev/nextcli-checks@v2. Release this file and the
+# action together, and move the v2 tag for both.
 name: AI Checks
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-
-concurrency:
-  group: ai-checks-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  workflow_call:
+    inputs:
+      provider:
+        description: Model provider (anthropic, openai, deepseek, openrouter, openai-compatible)
+        type: string
+        required: true
+      model:
+        description: Model id
+        type: string
+        required: true
+      agent:
+        description: opencode (default), nextcli, or claude-code
+        type: string
+        default: opencode
+      base-url:
+        description: Provider base URL. Required for openai-compatible.
+        type: string
+        default: ""
+      checks-dir:
+        description: Directory of check markdown files, read from the pull request's base commit
+        type: string
+        default: .checks
+      pr-number:
+        description: Pull request number. Defaults to the pull request of the triggering event.
+        type: string
+        default: ""
+      timeout-per-check:
+        description: Minutes allowed per check
+        type: string
+        default: "10"
+      on-error:
+        description: Check-run conclusion when a check errors (neutral or failure)
+        type: string
+        default: neutral
+    secrets:
+      api-key:
+        description: Provider API key. When empty (pull requests from forks), the checks are skipped.
+        required: false
 
 jobs:
   discover:
-    if: vars.CHECKS_PROVIDER != '' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
+      pull-requests: read
     outputs:
-      checks: ${{ steps.list.outputs.checks }}
-      skip: ${{ steps.bot.outputs.skip }}
+      checks: ${{ steps.result.outputs.checks }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Skip commits from github-actions
-        id: bot
+      - name: Check configuration
+        id: config
         env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: bash scripts/skip-bot.sh
+          API_KEY: ${{ secrets.api-key }}
+          PROVIDER: ${{ inputs.provider }}
+        run: |
+          if [ -z "$API_KEY" ] || [ -z "$PROVIDER" ]; then
+            echo "::notice::No provider or API key (for example on a pull request from a fork). AI checks are skipped."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: List checks
         id: list
+        if: steps.config.outputs.enabled == 'true'
+        uses: nextcli-dev/nextcli-checks@v2
+        with:
+          mode: list
+          pr-number: ${{ inputs.pr-number }}
+          checks-dir: ${{ inputs.checks-dir }}
+
+      - name: Result
+        id: result
         env:
-          CHECKS_DIR: .checks
-          SKIP: ${{ steps.bot.outputs.skip }}
-        run: |
-          if [ "$SKIP" = "true" ]; then
-            echo 'checks=["skip"]' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          count="$(python3 scripts/checks.py list --dir "$CHECKS_DIR" --lines | wc -l | tr -d ' ')"
-          if [ "$count" = "0" ]; then
-            echo 'checks=["skip"]' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          {
-            echo "checks<<EOF"
-            bash scripts/list-checks.sh
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          CHECKS: ${{ steps.list.outputs.checks || '[]' }}
+        run: echo "checks=${CHECKS}" >> "$GITHUB_OUTPUT"
 
   checks:
+    name: check/${{ matrix.check }}
     needs: discover
-    if: needs.discover.result == 'success'
+    if: needs.discover.outputs.checks != '[]' && needs.discover.outputs.checks != ''
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Covers agent install, one check, and its single retry.
+    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
@@ -70,19 +111,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        check: ${{ fromJson(needs.discover.outputs.checks || '["skip"]') }}
+        check: ${{ fromJson(needs.discover.outputs.checks) }}
     steps:
-      - name: Run check
-        if: needs.discover.outputs.skip != 'true' && matrix.check != 'skip'
-        uses: ./
+      - uses: nextcli-dev/nextcli-checks@v2
         with:
-          agent: ${{ vars.CHECKS_AGENT }}
-          provider: ${{ vars.CHECKS_PROVIDER }}
-          model: ${{ vars.CHECKS_MODEL }}
-          api-key: ${{ secrets.PROVIDER_API_KEY }}
-          base-url: ${{ vars.CHECKS_BASE_URL }}
+          mode: run
           check: ${{ matrix.check }}
-
-      - name: Nothing to run
-        if: needs.discover.outputs.skip == 'true' || matrix.check == 'skip'
-        run: echo "No checks to run."
+          pr-number: ${{ inputs.pr-number }}
+          checks-dir: ${{ inputs.checks-dir }}
+          agent: ${{ inputs.agent }}
+          provider: ${{ inputs.provider }}
+          model: ${{ inputs.model }}
+          base-url: ${{ inputs.base-url }}
+          api-key: ${{ secrets.api-key }}
+          timeout-per-check: ${{ inputs.timeout-per-check }}
+          on-error: ${{ inputs.on-error }}

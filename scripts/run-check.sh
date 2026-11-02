@@ -41,13 +41,13 @@ if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
     -f "head_sha=${HEAD_SHA}" \
     -f status=in_progress \
     --jq '.id')"
+  # close-check-runs.sh completes any run left in progress by a cancelled or
+  # timed-out job.
+  echo "$check_run_id" >> /tmp/check-runs-started.txt
 fi
 
 write_error_verdict() {
   local message="$1"
-  if [ -n "${PROVIDER_API_KEY:-}" ]; then
-    message="${message//${PROVIDER_API_KEY}/[REDACTED]}"
-  fi
   REASON="$message" python3 -c 'import json,os,sys; json.dump({"verdict":"ERROR","reason":os.environ["REASON"],"suggestions":[]}, sys.stdout)' > "$verdict_file"
 }
 
@@ -72,9 +72,14 @@ run_agent() {
   fi
   "${render_args[@]}" > "$prompt"
   set +e
+  # The agent gets the provider key and nothing else secret: no GitHub token
+  # and no Actions runtime tokens.
   CHECKS_PROVIDER="$provider" CHECKS_MODEL="$model" \
     timeout "${timeout_minutes}m" \
-    bash "$script_dir/agents/${agent}.sh" "$prompt" > "$raw" 2> "$err"
+    env -u GH_TOKEN -u GITHUB_TOKEN \
+      -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL -u ACTIONS_RESULTS_URL -u ACTIONS_CACHE_URL \
+      -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
+      bash "$script_dir/agents/${agent}.sh" "$prompt" > "$raw" 2> "$err"
   local code=$?
   set -e
   return "$code"
@@ -105,4 +110,6 @@ elif ! bash "$script_dir/parse-verdict.sh" < "$raw" > "$verdict_file"; then
   fi
 fi
 
+# Nothing the agent wrote is posted or uploaded until secrets are removed.
+python3 "$script_dir/checks.py" redact "$verdict_file" "$raw" "$err" "$prompt"
 bash "$script_dir/report.sh" "$name" "$verdict_file" "$check_run_id"

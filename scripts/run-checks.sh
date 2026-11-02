@@ -39,6 +39,24 @@ if [ "${#names[@]}" -eq 0 ]; then
   exit 0
 fi
 
+# A skipped run still publishes a completed check run per check, so nothing
+# waits on a check that will never report.
+if [ -n "${CHECKS_SKIP_REASON:-}" ]; then
+  for name in "${names[@]}"; do
+    echo "check/${name}: skipped (${CHECKS_SKIP_REASON})"
+    if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+      gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
+        -f "name=check/${name}" \
+        -f "head_sha=${HEAD_SHA}" \
+        -f status=completed \
+        -f conclusion=skipped \
+        -f "output[title]=Skipped" \
+        -f "output[summary]=${CHECKS_SKIP_REASON}" >/dev/null
+    fi
+  done
+  exit 0
+fi
+
 for name in "${names[@]}"; do
   bash "$script_dir/run-check.sh" "${checks_dir}/${name}.md"
 done
