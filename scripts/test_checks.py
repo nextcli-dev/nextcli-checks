@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -221,6 +223,107 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(checks.conclusion_for("FAIL", "neutral"), "failure")
         self.assertEqual(checks.conclusion_for("ERROR", "neutral"), "neutral")
         self.assertEqual(checks.conclusion_for("ERROR", "failure"), "failure")
+
+
+INSTALL_SCRIPT = Path(__file__).with_name("install-agent.sh")
+
+# Stubs log their argv (one call per line) to $STUB_LOG.
+NPM_STUB = """#!/usr/bin/env bash
+echo "npm $*" >> "$STUB_LOG"
+if [ "$1" = install ]; then
+  printf '#!/usr/bin/env bash\\necho "%s"\\n' "${3##*@}" > "$STUB_BIN/cn"
+  chmod +x "$STUB_BIN/cn"
+fi
+"""
+GIT_STUB = """#!/usr/bin/env bash
+echo "git $*" >> "$STUB_LOG"
+if [ "$3" = checkout ]; then
+  mkdir -p "$2/extensions/cli/dist"
+  printf '#!/usr/bin/env bash\\necho 0.0.0-dev\\n' > "$2/extensions/cli/dist/cn.js"
+fi
+"""
+
+
+class InstallAgentTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.log = root / "calls.log"
+        self.log.touch()
+        self.home = root / "home"
+        self.home.mkdir()
+        self.src = root / "src"
+        for name, body in (("npm", NPM_STUB), ("git", GIT_STUB)):
+            stub = self.bin / name
+            stub.write_text(body)
+            stub.chmod(0o755)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def install_cn(self, version: str):
+        cn = self.bin / "cn"
+        cn.write_text(f"#!/usr/bin/env bash\necho {version}\n")
+        cn.chmod(0o755)
+
+    def run_install(self, **env: str):
+        full_env = {
+            "PATH": f"{self.bin}:/usr/bin:/bin",
+            "HOME": str(self.home),
+            "STUB_LOG": str(self.log),
+            "STUB_BIN": str(self.bin),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_NEXTCLI_SRC_DIR": str(self.src),
+            **env,
+        }
+        result = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT)], env=full_env, capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result, self.log.read_text().splitlines()
+
+    def test_default_version_is_pinned(self):
+        result, calls = self.run_install()
+        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.1.1"])
+        self.assertEqual(result.stdout.strip(), "0.1.1")
+
+    def test_agent_version_pins_nextcli(self):
+        _, calls = self.run_install(CHECKS_AGENT_VERSION="0.2.0")
+        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.2.0"])
+
+    def test_matching_installed_cn_is_kept(self):
+        self.install_cn("0.1.1")
+        result, calls = self.run_install()
+        self.assertEqual(calls, [])
+        self.assertEqual(result.stdout.strip(), "0.1.1")
+
+    def test_mismatched_installed_cn_is_reinstalled(self):
+        self.install_cn("0.1.0")
+        result, calls = self.run_install()
+        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.1.1"])
+        self.assertEqual(result.stdout.strip(), "0.1.1")
+
+    def test_commit_sha_ref_is_fetched(self):
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        self.install_cn("0.1.1")  # an installed cn does not skip the source build
+        _, calls = self.run_install(
+            CHECKS_NEXTCLI_REF=sha, CHECKS_NEXTCLI_REPOSITORY="https://example.test/nextcli.git"
+        )
+        src = str(self.src)
+        self.assertEqual(
+            calls,
+            [
+                f"git -C {src} init --quiet",
+                f"git -C {src} remote add origin https://example.test/nextcli.git",
+                f"git -C {src} fetch --depth 1 origin {sha}",
+                f"git -C {src} checkout --quiet FETCH_HEAD",
+                "npm run build:local-deps",
+                "npm run build",
+            ],
+        )
+        self.assertTrue((self.home / ".local" / "bin" / "cn").is_symlink())
 
 
 if __name__ == "__main__":

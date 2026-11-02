@@ -120,8 +120,8 @@ Leave `base-url` empty for a named provider unless you need a gateway. Set `CHEC
 | Input | Default | Description |
 | --- | --- | --- |
 | `agent` | `opencode` | Agent CLI that runs each check: `opencode`, `nextcli`, or `claude-code`. |
-| `agent-version` | empty | Version of `opencode-ai` or `@anthropic-ai/claude-code` to install. It does not pin the `nextcli` agent yet. |
-| `nextcli-ref` | empty | Branch or tag of NextCLI to build from source when `agent` is `nextcli` and `cn` is not already installed. Commit SHAs are not supported. |
+| `agent-version` | empty | Version of the agent CLI to install. Defaults to `opencode-ai` 1.19.5, `@anthropic-ai/claude-code` 2.1.312, or `@nextcli/cli` 0.1.1. An installed `cn` at another version is replaced. |
+| `nextcli-ref` | empty | Branch, tag, or commit SHA of NextCLI to build from source when `agent` is `nextcli`. When set, `agent-version` is ignored for `nextcli`. |
 | `nextcli-repository` | `https://github.com/nextcli-dev/nextcli.git` | Repository cloned when `nextcli-ref` is set. |
 | `timeout-per-check` | `10` | Minutes allowed for each check before it is reported as an error. |
 | `max-diff-bytes` | `100000` | Maximum number of PR diff bytes passed to the agent. |
@@ -129,13 +129,13 @@ Leave `base-url` empty for a named provider unless you need a gateway. Set `CHEC
 | `check` | empty | Run only this check (the file name without `.md`). |
 | `checks-dir` | `.checks` | Directory of check markdown files, relative to the repository root. |
 
-Until `@nextcli/cli` is published to npm, the `nextcli` agent needs `nextcli-ref` so the action can build `cn` from source. The build adds several minutes to each job:
+The `nextcli` agent installs `@nextcli/cli` from npm, pinned to `agent-version`. To run unreleased NextCLI code instead, set `nextcli-ref` and the action builds `cn` from source. The build adds several minutes to each job:
 
 ```yaml
       - uses: nextcli-dev/nextcli-checks@v1
         with:
           agent: nextcli
-          nextcli-ref: main
+          nextcli-ref: main   # optional: a branch, tag, or commit SHA
           provider: ${{ vars.CHECKS_PROVIDER }}
           model: ${{ vars.CHECKS_MODEL }}
           api-key: ${{ secrets.PROVIDER_API_KEY }}

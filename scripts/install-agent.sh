@@ -17,35 +17,48 @@ case "$agent" in
     claude --version
     ;;
   nextcli)
-    if command -v cn >/dev/null 2>&1; then
-      cn --version
-      exit 0
-    fi
     if [ -n "${CHECKS_NEXTCLI_REF:-}" ]; then
+      # Build from source. git fetch (unlike git clone --branch) also accepts a commit SHA.
+      ref="$CHECKS_NEXTCLI_REF"
       repo="${CHECKS_NEXTCLI_REPOSITORY:-https://github.com/nextcli-dev/nextcli.git}"
-      rm -rf /tmp/nextcli-src
-      git clone --depth 1 --branch "$CHECKS_NEXTCLI_REF" "$repo" /tmp/nextcli-src
+      src_dir="${CHECKS_NEXTCLI_SRC_DIR:-/tmp/nextcli-src}"
+      rm -rf "$src_dir"
+      mkdir -p "$src_dir"
+      git -C "$src_dir" init --quiet
+      git -C "$src_dir" remote add origin "$repo"
+      git -C "$src_dir" fetch --depth 1 origin "$ref"
+      git -C "$src_dir" checkout --quiet FETCH_HEAD
       (
-        cd /tmp/nextcli-src/extensions/cli
+        cd "$src_dir/extensions/cli"
         npm run build:local-deps
         npm run build
       )
       install_dir="${HOME}/.local/bin"
       mkdir -p "$install_dir"
-      ln -sfn /tmp/nextcli-src/extensions/cli/dist/cn.js "${install_dir}/cn"
-      chmod +x /tmp/nextcli-src/extensions/cli/dist/cn.js
+      ln -sfn "$src_dir/extensions/cli/dist/cn.js" "${install_dir}/cn"
+      chmod +x "$src_dir/extensions/cli/dist/cn.js"
       if [ -n "${GITHUB_PATH:-}" ]; then
         echo "$install_dir" >> "$GITHUB_PATH"
       fi
       export PATH="${install_dir}:${PATH}"
       cn --version
-    else
-      if ! npm install -g @nextcli/cli; then
-        echo "The NextCLI CLI is not published to npm yet. Pass nextcli-ref to build it from source, or set agent to opencode." >&2
-        exit 1
-      fi
-      cn --version
+      exit 0
     fi
+    # Bump this default with each @nextcli/cli release. 0.1.0 is deprecated (interactive mode exits at startup).
+    version="${version:-0.1.1}"
+    if command -v cn >/dev/null 2>&1; then
+      installed="$(cn --version 2>/dev/null | tr -d '[:space:]' || true)"
+      if [ "$installed" = "$version" ]; then
+        echo "$installed"
+        exit 0
+      fi
+      echo "cn ${installed:-unknown} is installed; installing @nextcli/cli@${version}." >&2
+    fi
+    if ! npm install -g "@nextcli/cli@${version}"; then
+      echo "Could not install @nextcli/cli@${version}. Check that the version exists (npm view @nextcli/cli versions), pass nextcli-ref to build from source, or set agent to opencode." >&2
+      exit 1
+    fi
+    cn --version
     ;;
   *)
     echo "Unknown agent '${agent}'. Use opencode, nextcli, or claude-code." >&2

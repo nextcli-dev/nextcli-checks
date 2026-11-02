@@ -12,7 +12,7 @@ inputs:
     required: false
     default: opencode
   agent-version:
-    description: Version of the agent CLI to install. Defaults to opencode-ai 1.19.5 or @anthropic-ai/claude-code 2.1.312.
+    description: Version of the agent CLI to install. Defaults to opencode-ai 1.19.5, @anthropic-ai/claude-code 2.1.312, or @nextcli/cli 0.1.1. Ignored for nextcli when nextcli-ref is set.
     required: false
     default: ""
   provider:
@@ -49,7 +49,7 @@ inputs:
     required: false
     default: .checks
   nextcli-ref:
-    description: Git ref used to build the NextCLI CLI from source when agent is nextcli and cn is not already installed.
+    description: Branch, tag, or commit SHA used to build the NextCLI CLI from source when agent is nextcli. When empty, @nextcli/cli is installed from npm at agent-version.
     required: false
     default: ""
   nextcli-repository:
@@ -85,7 +85,7 @@ runs:
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.npm
-        key: checks-agent-${{ inputs.agent }}-${{ inputs.agent-version || 'default' }}-${{ runner.os }}
+        key: checks-agent-${{ inputs.agent }}-${{ inputs.agent-version || 'default' }}-${{ inputs.nextcli-ref || 'npm' }}-${{ runner.os }}
 
     - name: Install agent CLI
       if: steps.bot.outputs.skip != 'true'
