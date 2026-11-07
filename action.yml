@@ -1,5 +1,5 @@
 name: AI Checks
-description: Run .checks markdown files as a read-only agent on a pull request. The provider, model, API key, and base URL are inputs, so the workflow is not tied to one vendor. Check definitions are read from the pull request's base commit, so a pull request cannot change the checks that review it.
+description: Run .checks markdown files as a read-only agent on a pull request and post the results as one comment. The provider, model, API key, and base URL are inputs, so the workflow is not tied to one vendor. Check definitions are read from the pull request's base commit, so a pull request cannot change the checks that review it.
 author: nextcli-dev
 
 branding:
@@ -8,7 +8,7 @@ branding:
 
 inputs:
   mode:
-    description: run (default) runs checks and reports them. list only outputs the JSON array of check names in `checks`, for a matrix.
+    description: run (default) runs checks and completes their check runs. list only outputs the JSON array of check names in `checks`, for a matrix. comment posts the results in results-dir as one pull request comment, or updates the comment from an earlier run.
     required: false
     default: run
   pr-number:
@@ -20,7 +20,7 @@ inputs:
     required: false
     default: opencode
   agent-version:
-    description: Version of the agent CLI to install. Defaults to opencode-ai 1.19.5, @anthropic-ai/claude-code 2.1.312, or @nextcli/cli 0.1.1. Ignored for nextcli when nextcli-ref is set.
+    description: Version of the agent CLI to install. Defaults to opencode-ai 1.19.5, @anthropic-ai/claude-code 2.1.312, or @nextcli/cli 0.9.0. Ignored for nextcli when nextcli-ref is set.
     required: false
     default: ""
   provider:
@@ -37,6 +37,14 @@ inputs:
     default: ""
   base-url:
     description: Provider base URL. Optional for named providers. Required for openai-compatible.
+    required: false
+    default: ""
+  max-cost:
+    description: US dollars one check may spend, for the nextcli agent. Near the limit the agent stops and reports what it found so far, and the comment marks the review as partial. Empty for no limit. Other agents ignore it.
+    required: false
+    default: "1"
+  results-dir:
+    description: In comment mode, the directory that holds the check-*.verdict.json files from the run jobs, usually their downloaded check-results artifacts.
     required: false
     default: ""
   timeout-per-check:
@@ -88,8 +96,8 @@ runs:
       run: |
         set -euo pipefail
         case "$MODE" in
-          run|list) ;;
-          *) echo "::error::mode must be run or list (got '$MODE')."; exit 1 ;;
+          run|list|comment) ;;
+          *) echo "::error::mode must be run, list or comment (got '$MODE')."; exit 1 ;;
         esac
         number="${PR_INPUT:-$EVENT_PR}"
         if [ -z "$number" ]; then
@@ -117,6 +125,7 @@ runs:
     # Check definitions come from the base commit, so the pull request under
     # review cannot edit or delete them.
     - name: Checkout the checks from the base commit
+      if: inputs.mode != 'comment'
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ steps.pr.outputs.base_sha }}
@@ -189,6 +198,7 @@ runs:
         PROVIDER_API_KEY: ${{ inputs.api-key }}
         CHECKS_BASE_URL: ${{ inputs.base-url }}
         CHECKS_TIMEOUT: ${{ inputs.timeout-per-check }}
+        CHECKS_MAX_COST: ${{ inputs.max-cost }}
         CHECKS_ON_ERROR: ${{ inputs.on-error }}
         CHECKS_ONLY: ${{ inputs.check }}
         CHECKS_DIR: ${{ github.workspace }}/.nextcli-checks-base/${{ inputs.checks-dir }}
@@ -224,3 +234,17 @@ runs:
         path: /tmp/check-*.json
         retention-days: 7
         if-no-files-found: ignore
+
+    # One comment for every check, edited in place on later runs. Each finding
+    # links to its file and line; there are no inline review comments.
+    - name: Post the combined comment
+      if: inputs.mode == 'comment'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        CHECKS_RESULTS_DIR: ${{ inputs.results-dir }}
+        CHECKS_MAX_COST: ${{ inputs.max-cost }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/comment.sh"

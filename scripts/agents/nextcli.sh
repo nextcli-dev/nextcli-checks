@@ -29,4 +29,19 @@ chmod 600 "$config"
 trap 'rm -f "$config"' EXIT
 python3 "$script_dir/../checks.py" nextcli-config > "$config"
 
-exec cn -p --format json --readonly --config "$config" "$(cat "$prompt_file")"
+# The key is in the config file now. Keep it out of the agent's environment.
+unset PROVIDER_API_KEY
+
+# --readonly in headless mode: read, search and list only. No shell, no MCP
+# tools and no Fetch. At --max-cost the agent gives a final answer and exits 3.
+args=(-p --format json --readonly --config "$config")
+if [ -n "${CHECKS_MAX_COST:-}" ]; then
+  args+=(--max-cost "$CHECKS_MAX_COST")
+fi
+
+# Not exec: the trap must remove the config file when cn exits.
+set +e
+cn "${args[@]}" "$(cat "$prompt_file")"
+code=$?
+set -e
+exit "$code"

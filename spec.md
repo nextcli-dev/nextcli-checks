@@ -323,17 +323,19 @@ The runner is the composite action in [`action.yml`](./action.yml). A caller pas
 
 `agent` defaults to opencode. `nextcli` writes a temporary NextCLI `config.yaml` (see `scripts/agents/nextcli.sh`) and runs `cn -p --readonly --config <file>`. `claude-code` only supports Anthropic-compatible endpoints (`anthropic`, `openrouter`, and `deepseek`) and fails that check with a clear error for any other provider.
 
-The workflow in [`.github/workflows/checks.yml`](./.github/workflows/checks.yml) is the parallel form: one job per check file, with the agent install cached. A one-step workflow that runs every check in a single job is in the README. Both post individual status checks and committable suggestion comments when a check fails.
+The workflow in [`.github/workflows/checks.yml`](./.github/workflows/checks.yml) is the parallel form: one job per check file, with the agent install cached. A one-step workflow that runs every check in a single job is in the README. Each check completes a status check. One pull request comment, edited in place, holds every result: verdict, summary, and findings that link to the file and line. There are no inline suggestion comments.
 
-When a check passes, it completes silently — no comment noise. When a check fails with actionable suggestions, it posts a pull request review with GitHub suggestion comments that can be committed directly from the PR UI. Each suggestion comment is labeled with the check name that produced it. If a check fails without suggestions (or the review can't be posted), it falls back to a plain PR comment.
+`max-cost` (default `1`) is the dollar cap per check. `nextcli` enforces it with `--max-cost` and, when the cap is reached, still returns a result. The comment marks that review partial (`complete: false`, or verdict `INCOMPLETE` when the agent stopped before a verdict). A run with a cap is not retried. Other agents print a notice and ignore the cap.
+
+When a check passes, its section of the comment says so. A failing check lists findings in the same comment. A later run updates that comment instead of adding another. An earlier v2 "changes requested" review is dismissed.
 
 > **Note:** Because check runs are created by the GitHub Actions app, the "Details" link on each check always points to the Actions workflow log — not the review comment. GitHub locks `details_url` for its own app's check runs. To control where the "Details" link points, you'd need to register a custom GitHub App that creates the check runs under its own identity, which allows setting `details_url` to any URL.
 
 ### What This Gets You
 
 - Individual GitHub status checks per check file (green/red on the PR)
-- Committable suggestion comments on failures (applied directly from the PR UI)
-- Silent passes. No comment noise when checks pass
+- One combined pull request comment, updated in place, with linked findings and the cost
+- Partial results when a check stops at its cost cap, instead of a lost run
 - Artifact storage for debugging agent reasoning
 - Concurrency control to cancel stale runs
 - A provider-neutral configuration: `PROVIDER_API_KEY` plus provider, model, and base URL variables
@@ -377,11 +379,11 @@ Each check is a full agent session: reads files, processes a diff, reasons about
 
 **Mitigation:** Start with 3-5 high-value checks. Add early-exit conditions in check prompts ("If no migration files were added or changed, no action is needed"). Monitor cost per check and prune checks with low acceptance rates.
 
-### Surfacing Suggested Fixes
+### Surfacing Findings
 
-When a check fails with suggestions, the workflow posts a pull request review with GitHub suggestion comments. These are committable directly from the PR UI: one click to accept a fix. The agent returns structured suggestions with file, line range, and replacement code; the workflow constructs a review payload with ````suggestion` blocks and posts it via the GitHub API.
+Findings go in the combined comment, not as line comments. Each finding has a title, a link to `file:line` at the reviewed commit, and markdown details that can include a fenced code example. The comment is truncated at GitHub's 65,536-character limit and points at the check run for the rest. `@mentions` in model output are neutralized, and secrets are redacted before anything is posted.
 
-Edge cases to watch: suggestions on lines not in the diff will be rejected by GitHub (the workflow handles this gracefully). Accepting a suggestion creates a new commit, which triggers `synchronize`, which reruns all checks. If rerun loops become a problem, add commit-author detection to skip runs triggered by `github-actions[bot]`.
+A run that hits `--max-cost` still writes that comment. If the agent returned a verdict, it is kept and marked partial. If it returned nothing, the verdict is `INCOMPLETE` and the check run is neutral.
 
 ### Session Continuity
 
