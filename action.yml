@@ -20,7 +20,7 @@ inputs:
     required: false
     default: opencode
   agent-version:
-    description: Version of the agent CLI to install. Defaults to opencode-ai 1.19.5, @anthropic-ai/claude-code 2.1.312, or @nextcli/cli 0.9.0. Ignored for nextcli when nextcli-ref is set.
+    description: Version of the agent CLI to install. Defaults to opencode-ai 1.19.5, @anthropic-ai/claude-code 2.1.312, or @nextcli/cli 0.8.0. Ignored for nextcli when nextcli-ref is set.
     required: false
     default: ""
   provider:
