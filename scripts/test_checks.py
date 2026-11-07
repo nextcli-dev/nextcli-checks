@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -24,7 +25,8 @@ class ParseVerdictTest(unittest.TestCase):
         )
         parsed = checks.parse_verdict(raw)
         self.assertEqual(parsed["verdict"], "FAIL")
-        self.assertEqual(parsed["reason"], "Missing tests")
+        self.assertEqual(parsed["summary"], "Missing tests")
+        self.assertTrue(parsed["complete"])
 
     def test_claude_envelope_with_fences(self):
         inner = (
@@ -35,7 +37,7 @@ class ParseVerdictTest(unittest.TestCase):
         raw = json.dumps({"result": inner, "type": "result"})
         parsed = checks.parse_verdict(raw)
         self.assertEqual(parsed["verdict"], "PASS")
-        self.assertEqual(parsed["suggestions"], [])
+        self.assertEqual(parsed["findings"], [])
 
     def test_nextcli_wrapped_response(self):
         inner = '{"verdict":"FAIL","reason":"Secret in source","suggestions":[{"file":"a.ts","line":4,"replacement":"const key = process.env.KEY","comment":"Move it"}]}'
@@ -47,8 +49,12 @@ class ParseVerdictTest(unittest.TestCase):
             }
         )
         parsed = checks.parse_verdict(raw)
-        self.assertEqual(parsed["suggestions"][0]["line"], 4)
-        self.assertEqual(parsed["suggestions"][0]["start_line"], 4)
+        finding = parsed["findings"][0]
+        self.assertEqual(finding["file"], "a.ts")
+        self.assertEqual(finding["line"], 4)
+        self.assertNotIn("start_line", finding)
+        self.assertEqual(finding["title"], "Move it")
+        self.assertIn("```\nconst key = process.env.KEY\n```", finding["details"])
 
     def test_opencode_events(self):
         body = json.dumps(
@@ -73,8 +79,8 @@ class ParseVerdictTest(unittest.TestCase):
             ]
         )
         parsed = checks.parse_verdict(raw)
-        self.assertEqual(parsed["suggestions"][0]["start_line"], 2)
-        self.assertEqual(parsed["suggestions"][0]["line"], 3)
+        self.assertEqual(parsed["findings"][0]["start_line"], 2)
+        self.assertEqual(parsed["findings"][0]["line"], 3)
 
     def test_pass_drops_suggestions(self):
         raw = json.dumps(
@@ -92,7 +98,32 @@ class ParseVerdictTest(unittest.TestCase):
             }
         )
         parsed = checks.parse_verdict(raw)
-        self.assertEqual(parsed["suggestions"], [])
+        self.assertEqual(parsed["findings"], [])
+
+    def test_findings_format(self):
+        raw = json.dumps(
+            {
+                "verdict": "FAIL",
+                "summary": "One bug.",
+                "complete": False,
+                "findings": [
+                    {
+                        "file": "src/a.ts",
+                        "line": "12",
+                        "title": "Off by one",
+                        "details": "Use `<`.\n\n```ts\nfor (i = 0; i < n; i++)\n```",
+                    },
+                    {"file": "src/b.ts", "details": "Whole-file issue. More text."},
+                    {"line": 3, "title": "No file"},
+                ],
+            }
+        )
+        parsed = checks.parse_verdict(raw)
+        self.assertFalse(parsed["complete"])
+        self.assertEqual(len(parsed["findings"]), 2)
+        self.assertEqual(parsed["findings"][0]["line"], 12)
+        self.assertIsNone(parsed["findings"][1]["line"])
+        self.assertEqual(parsed["findings"][1]["title"], "Whole-file issue.")
 
     def test_invalid_returns_none(self):
         self.assertIsNone(checks.parse_verdict("not json at all"))
@@ -103,7 +134,7 @@ class ParseVerdictTest(unittest.TestCase):
             'notes\n{"verdict":"PASS","reason":"second","suggestions":[]}'
         )
         parsed = checks.parse_verdict(raw)
-        self.assertEqual(parsed["reason"], "second")
+        self.assertEqual(parsed["summary"], "second")
 
 
 class FrontmatterTest(unittest.TestCase):
@@ -188,41 +219,13 @@ class ConfigTest(unittest.TestCase):
         self.assertIn('apiKey: "sk-secret"', text)
         self.assertIn('apiBase: "https://api.example.com/v1"', text)
 
-    def test_review_payload_single_and_range(self):
-        verdict = {
-            "verdict": "FAIL",
-            "reason": "Two issues",
-            "suggestions": [
-                {
-                    "file": "a.ts",
-                    "start_line": 3,
-                    "line": 3,
-                    "replacement": "const a = 1",
-                    "comment": "one line",
-                },
-                {
-                    "file": "b.ts",
-                    "start_line": 4,
-                    "line": 6,
-                    "replacement": "line\nline",
-                    "comment": "range",
-                },
-            ],
-        }
-        payload = checks.review_payload("security-review", "abc", verdict)
-        self.assertEqual(payload["comments"][0]["line"], 3)
-        self.assertNotIn("start_line", payload["comments"][0])
-        self.assertEqual(payload["comments"][1]["start_line"], 4)
-        self.assertEqual(payload["comments"][1]["line"], 6)
-        self.assertIn("```suggestion\n", payload["comments"][0]["body"])
-        self.assertTrue(payload["body"].startswith("## check/security-review"))
-
     def test_conclusion(self):
         self.assertEqual(checks.conclusion_for("PASS", "neutral"), "success")
         self.assertEqual(checks.conclusion_for("SKIP", "failure"), "success")
         self.assertEqual(checks.conclusion_for("FAIL", "neutral"), "failure")
         self.assertEqual(checks.conclusion_for("ERROR", "neutral"), "neutral")
         self.assertEqual(checks.conclusion_for("ERROR", "failure"), "failure")
+        self.assertEqual(checks.conclusion_for("INCOMPLETE", "failure"), "neutral")
 
 
 INSTALL_SCRIPT = Path(__file__).with_name("install-agent.sh")
@@ -286,24 +289,24 @@ class InstallAgentTest(unittest.TestCase):
 
     def test_default_version_is_pinned(self):
         result, calls = self.run_install()
-        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.1.1"])
-        self.assertEqual(result.stdout.strip(), "0.1.1")
+        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.8.0"])
+        self.assertEqual(result.stdout.strip(), "0.8.0")
 
     def test_agent_version_pins_nextcli(self):
         _, calls = self.run_install(CHECKS_AGENT_VERSION="0.2.0")
         self.assertEqual(calls, ["npm install -g @nextcli/cli@0.2.0"])
 
     def test_matching_installed_cn_is_kept(self):
-        self.install_cn("0.1.1")
+        self.install_cn("0.8.0")
         result, calls = self.run_install()
         self.assertEqual(calls, [])
-        self.assertEqual(result.stdout.strip(), "0.1.1")
+        self.assertEqual(result.stdout.strip(), "0.8.0")
 
     def test_mismatched_installed_cn_is_reinstalled(self):
         self.install_cn("0.1.0")
         result, calls = self.run_install()
-        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.1.1"])
-        self.assertEqual(result.stdout.strip(), "0.1.1")
+        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.8.0"])
+        self.assertEqual(result.stdout.strip(), "0.8.0")
 
     def test_commit_sha_ref_is_fetched(self):
         sha = "0123456789abcdef0123456789abcdef01234567"
@@ -325,6 +328,122 @@ class InstallAgentTest(unittest.TestCase):
         )
         self.assertTrue((self.home / ".local" / "bin" / "cn").is_symlink())
 
+
+
+class CommentAndLimitTest(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("PROVIDER_API_KEY", None)
+
+    def test_render_comment_links_partial_note_redaction_and_mentions(self):
+        os.environ["PROVIDER_API_KEY"] = "sk-supersecretvalue"
+        body = checks.render_comment(
+            [
+                (
+                    "review",
+                    {
+                        "verdict": "FAIL",
+                        "summary": "Found sk-supersecretvalue and ping @alice",
+                        "complete": False,
+                        "limit": "cost",
+                        "usage": {"cost": 0.4, "priced": "exact"},
+                        "findings": [
+                            {
+                                "file": "src/a.ts",
+                                "line": 12,
+                                "title": "Off by one",
+                                "details": "See @bob and `keep@code`.",
+                            }
+                        ],
+                    },
+                )
+            ],
+            "nextcli-dev/nextcli",
+            "abcdef1234567890",
+            "1",
+        )
+        self.assertIn("<!-- nextcli-checks -->", body)
+        self.assertIn(
+            "[`src/a.ts:12`](https://github.com/nextcli-dev/nextcli/blob/abcdef1234567890/src/a.ts#L12)",
+            body,
+        )
+        self.assertIn("**Partial review.**", body)
+        self.assertIn("cost limit", body)
+        self.assertIn("[REDACTED]", body)
+        self.assertNotIn("sk-supersecretvalue", body)
+        self.assertNotIn("@alice", body)
+        self.assertNotIn("@bob", body)
+        self.assertIn("`keep@code`", body)
+        self.assertIn("cost $0.40", body)
+        self.assertIn("limit $1.00 per check", body)
+
+    def test_render_comment_truncates(self):
+        body = checks.render_comment(
+            [
+                (
+                    "review",
+                    {
+                        "verdict": "FAIL",
+                        "summary": "big",
+                        "findings": [
+                            {"file": "a.ts", "title": "t", "details": "x" * 70_000}
+                        ],
+                    },
+                )
+            ],
+            "o/r",
+            "abc1234",
+            "",
+        )
+        self.assertLessEqual(len(body), checks.GITHUB_TEXT_LIMIT)
+        self.assertIn("cut to fit in a comment", body)
+
+    def test_incomplete_gets_the_partial_note(self):
+        verdict = {
+            "verdict": "INCOMPLETE",
+            "summary": "The agent stopped at its cost limit ($1) before it returned a result.",
+            "complete": False,
+            "limit": "cost",
+            "findings": [],
+        }
+        note = checks.partial_note(verdict)
+        self.assertIn("**Partial review.**", note)
+        self.assertIn("cost limit", note)
+
+    def test_limit_exit_keeps_a_verdict_and_marks_it_partial(self):
+        summary = checks.read_run_summary(
+            "noise\n"
+            '{"status":"limit","limit":"cost","usage":{"cost":0.9,"priced":"exact",'
+            '"promptTokens":10,"completionTokens":20}}\n'
+        )
+        annotated = checks.annotate_verdict(
+            {
+                "verdict": "FAIL",
+                "summary": "bug",
+                "complete": True,
+                "findings": [],
+            },
+            summary,
+            True,
+        )
+        self.assertEqual(annotated["verdict"], "FAIL")
+        self.assertFalse(annotated["complete"])
+        self.assertEqual(annotated["limit"], "cost")
+        self.assertEqual(annotated["usage"]["cost"], 0.9)
+        self.assertIn("Partial review", checks.partial_note(annotated))
+
+    def test_limit_exit_without_a_verdict_stays_incomplete(self):
+        # run-check.sh writes this when exit code 3 has no parseable verdict.
+        verdict = {
+            "verdict": "INCOMPLETE",
+            "summary": "The agent stopped at its cost limit ($1) before it returned a result.",
+            "complete": False,
+            "findings": [],
+        }
+        annotated = checks.annotate_verdict(verdict, None, True)
+        self.assertEqual(annotated["verdict"], "INCOMPLETE")
+        self.assertEqual(annotated["limit"], "cost")
+        self.assertEqual(checks.conclusion_for(annotated["verdict"], "failure"), "neutral")
+        self.assertIn("Partial review", checks.partial_note(annotated))
 
 
 class RedactTest(unittest.TestCase):

@@ -15,6 +15,7 @@ import re
 import sys
 from pathlib import Path
 from posixpath import basename
+from urllib.parse import quote
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 KNOWN_PROVIDERS = (
@@ -244,35 +245,59 @@ def _candidate_texts(raw: str) -> list[str]:
     return texts
 
 
-def _normalize_suggestion(item: object) -> dict | None:
+def _positive_int(value: object) -> int | None:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 1 else None
+
+
+def _first_sentence(text: str, limit: int = 80) -> str:
+    first = text.strip().splitlines()[0] if text.strip() else ""
+    first = re.split(r"(?<=[.!?])\s", first, maxsplit=1)[0]
+    return first if len(first) <= limit else first[: limit - 1].rstrip() + "…"
+
+
+def _normalize_finding(item: object) -> dict | None:
+    """One finding: a file, an optional line, a title and markdown details.
+
+    Also accepts the v2 suggestion format (comment and replacement), which
+    opencode and claude-code checks written for v2 may still produce.
+    """
     if not isinstance(item, dict):
         return None
     file_name = item.get("file")
-    line = item.get("line")
-    replacement = item.get("replacement")
-    if not isinstance(file_name, str) or not file_name:
+    if not isinstance(file_name, str) or not file_name.strip():
         return None
-    if replacement is None:
-        return None
-    try:
-        line_number = int(line)
-    except (TypeError, ValueError):
-        return None
-    start = item.get("start_line", line_number)
-    try:
-        start_number = int(start) if start is not None else line_number
-    except (TypeError, ValueError):
-        start_number = line_number
-    if start_number > line_number or start_number < 1 or line_number < 1:
-        start_number = line_number
-    comment = item.get("comment")
-    return {
-        "file": file_name,
-        "start_line": start_number,
-        "line": line_number,
-        "replacement": str(replacement),
-        "comment": "" if comment is None else str(comment),
+    line = _positive_int(item.get("line"))
+    start_line = _positive_int(item.get("start_line"))
+    if start_line is not None and (line is None or start_line >= line):
+        start_line = None
+
+    details = item.get("details")
+    if not isinstance(details, str):
+        comment = item.get("comment")
+        replacement = item.get("replacement")
+        parts = []
+        if isinstance(comment, str) and comment.strip():
+            parts.append(comment.strip())
+        if replacement is not None:
+            parts.append(f"Suggested code:\n\n```\n{replacement}\n```")
+        details = "\n\n".join(parts)
+    title = item.get("title")
+    if not isinstance(title, str) or not title.strip():
+        title = _first_sentence(details) or "Finding"
+
+    finding = {
+        "file": file_name.strip(),
+        "line": line,
+        "title": title.strip(),
+        "details": details.strip(),
     }
+    if start_line is not None:
+        finding["start_line"] = start_line
+    return finding
 
 
 def normalize_verdict(obj: object) -> dict | None:
@@ -281,21 +306,28 @@ def normalize_verdict(obj: object) -> dict | None:
     verdict = obj.get("verdict")
     if verdict not in ("PASS", "FAIL"):
         return None
-    reason = obj.get("reason")
-    suggestions_in = obj.get("suggestions") or []
-    if not isinstance(suggestions_in, list):
+    summary = obj.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        summary = obj.get("reason")
+    findings_in = obj.get("findings")
+    if findings_in is None:
+        findings_in = obj.get("suggestions")
+    if findings_in is None:
+        findings_in = []
+    if not isinstance(findings_in, list):
         return None
-    suggestions = []
-    for item in suggestions_in:
-        normalized = _normalize_suggestion(item)
-        if normalized:
-            suggestions.append(normalized)
+    findings = [f for f in (_normalize_finding(item) for item in findings_in) if f]
     if verdict == "PASS":
-        suggestions = []
+        findings = []
     return {
         "verdict": verdict,
-        "reason": "No reason given" if not isinstance(reason, str) or not reason.strip() else reason.strip(),
-        "suggestions": suggestions,
+        "summary": (
+            summary.strip()
+            if isinstance(summary, str) and summary.strip()
+            else "No summary given"
+        ),
+        "complete": obj.get("complete") is not False,
+        "findings": findings,
     }
 
 
@@ -355,39 +387,154 @@ def nextcli_config(provider: str, model: str, api_key: str, base_url: str) -> st
     return "\n".join(lines) + "\n"
 
 
-def review_payload(name: str, sha: str, verdict: dict) -> dict:
-    comments = []
-    for suggestion in verdict.get("suggestions") or []:
-        comment = {
-            "path": suggestion["file"],
-            "side": "RIGHT",
-            "body": (
-                f"**check/{name}**\n\n{suggestion['comment']}\n\n"
-                f"```suggestion\n{suggestion['replacement']}\n```"
-            ),
-        }
-        if suggestion["start_line"] == suggestion["line"]:
-            comment["line"] = suggestion["line"]
-        else:
-            comment["start_line"] = suggestion["start_line"]
-            comment["line"] = suggestion["line"]
-        comments.append(comment)
-    return {
-        "event": "REQUEST_CHANGES",
-        "body": f"## check/{name}\n\n{verdict.get('reason', '')}",
-        "commit_id": sha,
-        "comments": comments,
-    }
+COMMENT_MARKER = "<!-- nextcli-checks -->"
+# GitHub rejects comments and check-run summaries over 65,536 characters
+GITHUB_TEXT_LIMIT = 65_536
+TRUNCATION_NOTE = "\n\n_The results were cut to fit in a comment. See the check runs for the rest._\n"
+MENTION_RE = re.compile(r"(?<![\w`])@(?=[A-Za-z0-9])")
+VERDICT_LABELS = {
+    "PASS": "Passed",
+    "FAIL": "Failed",
+    "SKIP": "Skipped",
+    "ERROR": "Error",
+    "INCOMPLETE": "Incomplete",
+}
 
 
-def check_run_body(verdict: dict, conclusion: str, details_url: str) -> dict:
-    reason = str(verdict.get("reason") or "No reason given")
+def _neutralize_mentions(text: str) -> str:
+    """Stop @name in model output from notifying people. Code is left as is."""
+    parts = re.split(r"(```.*?```|`[^`\n]*`)", text, flags=re.S)
+    return "".join(
+        part if part.startswith("`") else MENTION_RE.sub("@​", part)
+        for part in parts
+    )
+
+
+def _is_safe_relative_path(path: str) -> bool:
+    return (
+        not path.startswith(("/", "\\"))
+        and ".." not in path.replace("\\", "/").split("/")
+        and "://" not in path
+    )
+
+
+def finding_location(finding: dict, repo: str, sha: str) -> str:
+    """`file:line`, linked to the file at the reviewed commit when possible."""
+    path = finding["file"]
+    line = finding.get("line")
+    start = finding.get("start_line")
+    label = path
+    anchor = ""
+    if line:
+        label = f"{path}:{start}-{line}" if start else f"{path}:{line}"
+        anchor = f"#L{start}-L{line}" if start else f"#L{line}"
+    label_md = f"`{label.replace('`', '')}`"
+    if not repo or not sha or not _is_safe_relative_path(path):
+        return label_md
+    url = f"https://github.com/{repo}/blob/{sha}/{quote(path.lstrip('./'), safe='/')}{anchor}"
+    return f"[{label_md}]({url})"
+
+
+def _format_cost(usage: dict | None) -> str:
+    if not isinstance(usage, dict) or not isinstance(usage.get("cost"), (int, float)):
+        return ""
+    cost = f"${usage['cost']:.2f}"
+    if usage.get("priced") not in (None, "exact"):
+        cost += " (estimated)"
+    return cost
+
+
+def partial_note(verdict: dict) -> str:
+    if verdict.get("verdict") != "INCOMPLETE" and verdict.get("complete") is not False:
+        return ""
+    if verdict.get("limit") == "cost":
+        why = "It reached its cost limit before it finished"
+    elif verdict.get("limit") in ("turns", "tokens"):
+        why = f"It reached its {verdict['limit']} limit before it finished"
+    else:
+        why = "The agent did not finish"
+    return f"> **Partial review.** {why}. The findings cover only what it checked.\n"
+
+
+def render_findings(verdict: dict, repo: str, sha: str) -> str:
+    lines = []
+    for number, finding in enumerate(verdict.get("findings") or [], start=1):
+        lines.append(f"**{number}. {finding['title']}**")
+        lines.append(finding_location(finding, repo, sha))
+        if finding.get("details"):
+            lines.append("")
+            lines.append(finding["details"])
+        lines.append("")
+    return "\n".join(lines)
+
+
+def render_check_section(name: str, verdict: dict, repo: str, sha: str) -> str:
+    label = VERDICT_LABELS.get(verdict.get("verdict", ""), verdict.get("verdict", ""))
+    count = len(verdict.get("findings") or [])
+    heading = f"### `{name}`: {label}"
+    if count:
+        heading += f", {count} finding{'s' if count != 1 else ''}"
+    parts = [heading, "", verdict.get("summary") or ""]
+    note = partial_note(verdict)
+    if note:
+        parts += ["", note]
+    findings = render_findings(verdict, repo, sha)
+    if findings:
+        parts += ["", findings]
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def _fit(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - len(TRUNCATION_NOTE)].rstrip() + TRUNCATION_NOTE
+
+
+def render_comment(
+    results: list[tuple[str, dict]], repo: str, sha: str, max_cost: str = ""
+) -> str:
+    """The single pull request comment that holds every check's result."""
+    header = [COMMENT_MARKER, "## AI review", ""]
+    facts = [f"Commit `{sha[:7]}`" if sha else "", f"{len(results)} check{'s' if len(results) != 1 else ''}"]
+    costs = [v.get("usage", {}).get("cost") for _n, v in results if isinstance(v.get("usage"), dict)]
+    costs = [c for c in costs if isinstance(c, (int, float))]
+    if costs:
+        estimated = any(
+            (v.get("usage") or {}).get("priced") not in (None, "exact") for _n, v in results
+        )
+        cost = f"cost ${sum(costs):.2f}{' (estimated)' if estimated else ''}"
+        if max_cost:
+            cost += f", limit ${float(max_cost):.2f} per check"
+        facts.append(cost)
+    header.append(" · ".join(f for f in facts if f))
+    header.append("")
+    if not results:
+        header.append("No check produced a result. See the workflow run for details.")
+    body = "\n".join(header) + "\n"
+    for name, verdict in sorted(results, key=lambda item: item[0]):
+        body += "\n" + render_check_section(name, verdict, repo, sha)
+    body = _neutralize_mentions(redact_text(body, secrets_from_env()))
+    return _fit(body, GITHUB_TEXT_LIMIT)
+
+
+def check_run_body(verdict: dict, conclusion: str, details_url: str, repo: str = "", sha: str = "") -> dict:
+    summary = str(verdict.get("summary") or "No summary given")
+    text_parts = [summary]
+    note = partial_note(verdict)
+    if note:
+        text_parts.append(note)
+    findings = render_findings(verdict, repo, sha)
+    if findings:
+        text_parts.append(findings)
+    cost = _format_cost(verdict.get("usage"))
+    if cost:
+        text_parts.append(f"Cost: {cost}")
     body: dict = {
         "status": "completed",
         "conclusion": conclusion,
         "output": {
-            "title": reason[:140],
-            "summary": reason,
+            "title": summary.splitlines()[0][:140],
+            "summary": _fit(_neutralize_mentions("\n\n".join(text_parts)), GITHUB_TEXT_LIMIT),
         },
     }
     if details_url:
@@ -400,9 +547,42 @@ def conclusion_for(verdict: str, on_error: str) -> str:
         return "success"
     if verdict == "FAIL":
         return "failure"
+    if verdict == "INCOMPLETE":
+        return "neutral"
     if on_error == "failure":
         return "failure"
     return "neutral"
+
+
+def read_run_summary(stderr_text: str) -> dict | None:
+    """The agent's last stderr line when it is a NextCLI run summary."""
+    for line in reversed(stderr_text.strip().splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("status") in ("done", "limit"):
+            return parsed
+        return None
+    return None
+
+
+def annotate_verdict(verdict: dict, run_summary: dict | None, limit_exit: bool) -> dict:
+    """Adds the agent's usage, and marks a run ended by a limit as partial."""
+    annotated = dict(verdict)
+    limit = None
+    if run_summary:
+        if isinstance(run_summary.get("usage"), dict):
+            annotated["usage"] = run_summary["usage"]
+        limit = run_summary.get("limit")
+    if limit_exit or limit:
+        annotated["limit"] = limit or "cost"
+        if annotated.get("verdict") in ("PASS", "FAIL"):
+            annotated["complete"] = False
+    return annotated
 
 
 # Environment variables whose values must never appear in anything posted to
@@ -518,20 +698,55 @@ def cmd_nextcli_config(_args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_review_payload(args: argparse.Namespace) -> int:
+def cmd_check_run_body(args: argparse.Namespace) -> int:
     verdict = _read_verdict_file(args.verdict)
-    json.dump(review_payload(args.name, args.sha, verdict), sys.stdout)
+    json.dump(
+        check_run_body(
+            verdict,
+            args.conclusion,
+            args.details_url or "",
+            repo=args.repo or "",
+            sha=args.sha or "",
+        ),
+        sys.stdout,
+    )
     sys.stdout.write("\n")
     return 0
 
 
-def cmd_check_run_body(args: argparse.Namespace) -> int:
-    verdict = _read_verdict_file(args.verdict)
-    json.dump(
-        check_run_body(verdict, args.conclusion, args.details_url or ""),
-        sys.stdout,
+def load_results(directory: Path) -> list[tuple[str, dict]]:
+    """Verdict files written by run-check.sh, named check-<name>.verdict.json"""
+    results = []
+    for path in sorted(directory.rglob("check-*.verdict.json")):
+        name = path.name[len("check-") : -len(".verdict.json")]
+        try:
+            verdict = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(verdict, dict) and verdict.get("verdict"):
+            results.append((name, verdict))
+    return results
+
+
+def cmd_render_comment(args: argparse.Namespace) -> int:
+    directory = Path(args.dir)
+    results = load_results(directory) if directory.is_dir() else []
+    sys.stdout.write(
+        render_comment(results, args.repo or "", args.sha or "", args.max_cost or "")
     )
-    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_annotate(args: argparse.Namespace) -> int:
+    path = Path(args.verdict)
+    verdict = _read_verdict_file(args.verdict)
+    stderr_text = ""
+    if args.stderr and Path(args.stderr).is_file():
+        stderr_text = Path(args.stderr).read_text(errors="replace")
+    annotated = annotate_verdict(
+        verdict, read_run_summary(stderr_text), args.limit_exit
+    )
+    path.write_text(json.dumps(annotated))
     return 0
 
 
@@ -578,17 +793,32 @@ def build_parser() -> argparse.ArgumentParser:
     nextcli = sub.add_parser("nextcli-config")
     nextcli.set_defaults(func=cmd_nextcli_config)
 
-    review = sub.add_parser("review-payload")
-    review.add_argument("--name", required=True)
-    review.add_argument("--sha", required=True)
-    review.add_argument("--verdict")
-    review.set_defaults(func=cmd_review_payload)
-
     check_run = sub.add_parser("check-run-body")
     check_run.add_argument("--conclusion", required=True)
     check_run.add_argument("--details-url", default="")
     check_run.add_argument("--verdict")
+    check_run.add_argument("--repo", default="")
+    check_run.add_argument("--sha", default="")
     check_run.set_defaults(func=cmd_check_run_body)
+
+    comment = sub.add_parser(
+        "render-comment",
+        help="Render the pull request comment for every verdict file in a directory.",
+    )
+    comment.add_argument("--dir", required=True)
+    comment.add_argument("--repo", default="")
+    comment.add_argument("--sha", default="")
+    comment.add_argument("--max-cost", default="")
+    comment.set_defaults(func=cmd_render_comment)
+
+    annotate = sub.add_parser(
+        "annotate",
+        help="Add the agent's usage to a verdict file, and mark runs ended by a limit as partial.",
+    )
+    annotate.add_argument("--verdict", required=True)
+    annotate.add_argument("--stderr")
+    annotate.add_argument("--limit-exit", action="store_true")
+    annotate.set_defaults(func=cmd_annotate)
 
     redact = sub.add_parser(
         "redact",

@@ -1,10 +1,11 @@
 # Reusable workflow: runs every check in checks-dir on one pull request, one
 # job per check, in parallel. Each check reports as its own check run,
-# `check/<name>`.
+# `check/<name>`, and a last job posts all results as one pull request
+# comment, updated in place on later runs.
 #
 #   jobs:
 #     ai-checks:
-#       uses: nextcli-dev/nextcli-checks/.github/workflows/checks.yml@v2
+#       uses: nextcli-dev/nextcli-checks/.github/workflows/checks.yml@v3
 #       permissions:
 #         contents: read
 #         pull-requests: write
@@ -15,8 +16,8 @@
 #       secrets:
 #         api-key: ${{ secrets.PROVIDER_API_KEY }}
 #
-# The jobs below use nextcli-dev/nextcli-checks@v2. Release this file and the
-# action together, and move the v2 tag for both.
+# The jobs below use nextcli-dev/nextcli-checks@v3. Release this file and the
+# action together, and move the v3 tag for both.
 name: AI Checks
 
 on:
@@ -34,6 +35,18 @@ on:
         description: opencode (default), nextcli, or claude-code
         type: string
         default: opencode
+      agent-version:
+        description: Version of the agent CLI. Empty for the action's default.
+        type: string
+        default: ""
+      max-cost:
+        description: US dollars one check may spend (nextcli only). Near the limit the agent reports what it found so far. Empty for no limit.
+        type: string
+        default: "1"
+      check:
+        description: Run only this check (file name without .md). Empty runs every check in checks-dir.
+        type: string
+        default: ""
       base-url:
         description: Provider base URL. Required for openai-compatible.
         type: string
@@ -85,7 +98,7 @@ jobs:
       - name: List checks
         id: list
         if: steps.config.outputs.enabled == 'true'
-        uses: nextcli-dev/nextcli-checks@v2
+        uses: nextcli-dev/nextcli-checks@v3
         with:
           mode: list
           pr-number: ${{ inputs.pr-number }}
@@ -95,7 +108,17 @@ jobs:
         id: result
         env:
           CHECKS: ${{ steps.list.outputs.checks || '[]' }}
-        run: echo "checks=${CHECKS}" >> "$GITHUB_OUTPUT"
+          ONLY: ${{ inputs.check }}
+          ENABLED: ${{ steps.config.outputs.enabled }}
+        run: |
+          if [ -n "$ONLY" ] && [ "$ENABLED" = "true" ]; then
+            if ! printf '%s' "$CHECKS" | jq -e --arg c "$ONLY" 'index($c) != null' >/dev/null; then
+              echo "::error::Check '$ONLY' is not in the checks directory. Checks: $CHECKS"
+              exit 1
+            fi
+            CHECKS="$(jq -cn --arg c "$ONLY" '[$c]')"
+          fi
+          echo "checks=${CHECKS}" >> "$GITHUB_OUTPUT"
 
   checks:
     name: check/${{ matrix.check }}
@@ -113,16 +136,43 @@ jobs:
       matrix:
         check: ${{ fromJson(needs.discover.outputs.checks) }}
     steps:
-      - uses: nextcli-dev/nextcli-checks@v2
+      - uses: nextcli-dev/nextcli-checks@v3
         with:
           mode: run
           check: ${{ matrix.check }}
           pr-number: ${{ inputs.pr-number }}
           checks-dir: ${{ inputs.checks-dir }}
           agent: ${{ inputs.agent }}
+          agent-version: ${{ inputs.agent-version }}
           provider: ${{ inputs.provider }}
           model: ${{ inputs.model }}
           base-url: ${{ inputs.base-url }}
           api-key: ${{ secrets.api-key }}
+          max-cost: ${{ inputs.max-cost }}
           timeout-per-check: ${{ inputs.timeout-per-check }}
           on-error: ${{ inputs.on-error }}
+
+  comment:
+    name: AI review comment
+    needs: [discover, checks]
+    # Also after failed or cancelled checks, so the comment says what happened
+    if: always() && needs.discover.outputs.checks != '[]' && needs.discover.outputs.checks != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download check results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: check-results*
+          path: ${{ runner.temp }}/check-results
+          merge-multiple: true
+
+      - uses: nextcli-dev/nextcli-checks@v3
+        with:
+          mode: comment
+          pr-number: ${{ inputs.pr-number }}
+          results-dir: ${{ runner.temp }}/check-results
+          max-cost: ${{ inputs.max-cost }}

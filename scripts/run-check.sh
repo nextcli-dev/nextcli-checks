@@ -46,13 +46,17 @@ if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
   echo "$check_run_id" >> /tmp/check-runs-started.txt
 fi
 
+# Writes a verdict that isn't the agent's own: ERROR, SKIP or INCOMPLETE.
+write_verdict() {
+  VERDICT="$1" SUMMARY="$2" python3 -c 'import json,os,sys; v=os.environ["VERDICT"]; json.dump({"verdict":v,"summary":os.environ["SUMMARY"],"complete":v!="INCOMPLETE","findings":[]}, sys.stdout)' > "$verdict_file"
+}
+
 write_error_verdict() {
-  local message="$1"
-  REASON="$message" python3 -c 'import json,os,sys; json.dump({"verdict":"ERROR","reason":os.environ["REASON"],"suggestions":[]}, sys.stdout)' > "$verdict_file"
+  write_verdict ERROR "$1"
 }
 
 if [ "${fm_skip:-0}" = "1" ]; then
-  python3 -c 'import json,sys; json.dump({"verdict":"SKIP","reason":"No changed files match this check'\''s paths.","suggestions":[]}, sys.stdout)' > "$verdict_file"
+  write_verdict SKIP "No changed files match this check's paths."
   echo '{"skipped":true}' > "$raw"
   bash "$script_dir/report.sh" "$name" "$verdict_file" "$check_run_id"
   exit 0
@@ -85,30 +89,62 @@ run_agent() {
   return "$code"
 }
 
+# Exit code of an agent that stopped at a limit (NextCLI --max-cost and
+# friends). Its answer, if any, is still on stdout.
+LIMIT_EXIT=3
+
+# A second run would start a new cost budget, so a run with a cost limit is
+# not retried, whichever agent is selected. Only nextcli enforces the limit.
+retry_allowed=true
+if [ -n "${CHECKS_MAX_COST:-}" ]; then
+  retry_allowed=false
+  if [ "$agent" != "nextcli" ]; then
+    echo "::notice::max-cost only applies to the nextcli agent. check/${name} runs without a cost limit."
+  fi
+fi
+
+# Turns one agent run into a verdict file. Returns 1 when the output has no
+# verdict and the run may be retried.
+judge_run() {
+  local code="$1"
+  if [ "$code" -eq 124 ]; then
+    write_error_verdict "The check timed out after ${timeout_minutes} minutes."
+  elif [ "$code" -eq 2 ]; then
+    local message
+    message="$(tail -n 1 "$err" 2>/dev/null || true)"
+    write_error_verdict "${message:-The agent rejected this provider configuration.}"
+  elif bash "$script_dir/parse-verdict.sh" < "$raw" > "$verdict_file"; then
+    return 0
+  elif [ "$code" -eq "$LIMIT_EXIT" ]; then
+    write_verdict INCOMPLETE "The agent stopped at its cost limit (\$${CHECKS_MAX_COST:-?}) before it returned a result."
+  else
+    return 1
+  fi
+  return 0
+}
+
 set +e
 run_agent
 code=$?
 set -e
 
-if [ "$code" -eq 124 ]; then
-  write_error_verdict "The check timed out after ${timeout_minutes} minutes."
-elif [ "$code" -eq 2 ]; then
-  message="$(tail -n 1 "$err" 2>/dev/null || true)"
-  write_error_verdict "${message:-The agent rejected this provider configuration.}"
-elif ! bash "$script_dir/parse-verdict.sh" < "$raw" > "$verdict_file"; then
-  set +e
-  run_agent retry
-  retry_code=$?
-  set -e
-  if [ "$retry_code" -eq 124 ]; then
-    write_error_verdict "The check timed out after ${timeout_minutes} minutes."
-  elif [ "$retry_code" -eq 2 ]; then
-    message="$(tail -n 1 "$err" 2>/dev/null || true)"
-    write_error_verdict "${message:-The agent rejected this provider configuration.}"
-  elif ! bash "$script_dir/parse-verdict.sh" < "$raw" > "$verdict_file"; then
+if ! judge_run "$code"; then
+  if [ "$retry_allowed" = true ]; then
+    set +e
+    run_agent retry
+    code=$?
+    set -e
+    judge_run "$code" || write_error_verdict "The agent did not return a valid verdict."
+  else
     write_error_verdict "The agent did not return a valid verdict."
   fi
 fi
+
+limit_args=()
+if [ "$code" -eq "$LIMIT_EXIT" ]; then
+  limit_args+=(--limit-exit)
+fi
+python3 "$script_dir/checks.py" annotate --verdict "$verdict_file" --stderr "$err" ${limit_args[@]+"${limit_args[@]}"}
 
 # Nothing the agent wrote is posted or uploaded until secrets are removed.
 python3 "$script_dir/checks.py" redact "$verdict_file" "$raw" "$err" "$prompt"
