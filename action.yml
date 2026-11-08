@@ -224,14 +224,16 @@ runs:
       env:
         PROVIDER_API_KEY: ${{ inputs.api-key }}
         GH_TOKEN: ${{ github.token }}
-      run: python3 "$GITHUB_ACTION_PATH/scripts/checks.py" redact /tmp/check-*.json
+      run: python3 "$GITHUB_ACTION_PATH/scripts/checks.py" redact /tmp/check-*.json /tmp/check-*.err
 
     - name: Upload check outputs
       if: always() && inputs.mode == 'run' && steps.bot.outputs.skip != 'true'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: check-results${{ inputs.check != '' && format('-{0}', inputs.check) || '' }}
-        path: /tmp/check-*.json
+        path: |
+          /tmp/check-*.json
+          /tmp/check-*.err
         retention-days: 7
         if-no-files-found: ignore
 
