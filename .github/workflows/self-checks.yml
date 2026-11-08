@@ -1,14 +1,23 @@
 # Runs this repository's own .checks on its pull requests, through the
 # reusable workflow in this pull request, so changes to it are exercised
 # before release. Changes to the scripts are covered by ci.yml.
+#
+# Every run spends the provider key, so only lmolotii can start one: both the
+# person whose push or pull request event started the run and the person who
+# re-ran it must be lmolotii. Pull requests from forks get no secrets and are
+# skipped too.
 name: Self checks
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# Runs that won't check anything (someone other than lmolotii) get their own
+# group, so they can't cancel a run in progress.
 concurrency:
-  group: self-checks-${{ github.event.pull_request.number }}
+  group: >-
+    self-checks-${{ github.event.pull_request.number }}-${{
+    github.actor == 'lmolotii' && github.triggering_actor == 'lmolotii' && 'run' || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -16,7 +25,10 @@ permissions:
 
 jobs:
   ai-checks:
-    if: vars.CHECKS_PROVIDER != '' && github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      vars.CHECKS_PROVIDER != '' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor == 'lmolotii' && github.triggering_actor == 'lmolotii'
     uses: ./.github/workflows/checks.yml
     permissions:
       contents: read
