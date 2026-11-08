@@ -446,6 +446,47 @@ class CommentAndLimitTest(unittest.TestCase):
         self.assertEqual(checks.conclusion_for(annotated["verdict"], "failure"), "neutral")
         self.assertIn("Partial review", checks.partial_note(annotated))
 
+    def _no_verdict(self):
+        return {
+            "verdict": "ERROR",
+            "summary": "The agent did not return a valid verdict.",
+            "complete": True,
+            "findings": [],
+        }
+
+    def test_an_agent_error_is_named_and_its_usage_kept(self):
+        summary = checks.read_run_summary(
+            "noise\n"
+            '{"status":"error","message":"429 Too Many Requests",'
+            '"usage":{"cost":0.4,"priced":"exact","promptTokens":7,"completionTokens":8}}\n'
+        )
+        annotated = checks.annotate_verdict(self._no_verdict(), summary, False)
+        self.assertEqual(annotated["verdict"], "ERROR")
+        self.assertIn("did not return a valid verdict", annotated["summary"])
+        self.assertIn("stopped with an error: 429 Too Many Requests", annotated["summary"])
+        self.assertEqual(annotated["usage"]["promptTokens"], 7)
+        self.assertNotIn("limit", annotated)
+
+    def test_a_finished_run_without_an_answer_says_so(self):
+        summary = checks.read_run_summary(
+            '{"status":"done","limit":null,"usage":{"cost":0.8,"priced":"exact",'
+            '"promptTokens":5,"completionTokens":6}}\n'
+        )
+        annotated = checks.annotate_verdict(self._no_verdict(), summary, False)
+        self.assertIn("finished without writing an answer", annotated["summary"])
+        self.assertEqual(annotated["usage"]["cost"], 0.8)
+
+    def test_a_long_error_message_is_cut(self):
+        summary = {"status": "error", "message": "x" * 5000}
+        annotated = checks.annotate_verdict(self._no_verdict(), summary, False)
+        self.assertLess(len(annotated["summary"]), 700)
+
+    def test_a_verdict_keeps_its_summary_when_the_run_is_done(self):
+        summary = {"status": "done", "limit": None, "usage": {"cost": 0.1}}
+        verdict = {"verdict": "PASS", "summary": "fine", "complete": True, "findings": []}
+        annotated = checks.annotate_verdict(verdict, summary, False)
+        self.assertEqual(annotated["summary"], "fine")
+
 
 class RedactTest(unittest.TestCase):
     def test_redacts_every_occurrence(self):

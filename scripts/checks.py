@@ -555,7 +555,7 @@ def conclusion_for(verdict: str, on_error: str) -> str:
 
 
 def read_run_summary(stderr_text: str) -> dict | None:
-    """The agent's last stderr line when it is a NextCLI run summary."""
+    """The agent's last stderr line when it is a NextCLI run summary or error."""
     for line in reversed(stderr_text.strip().splitlines()):
         line = line.strip()
         if not line.startswith("{"):
@@ -564,20 +564,42 @@ def read_run_summary(stderr_text: str) -> dict | None:
             parsed = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict) and parsed.get("status") in ("done", "limit"):
+        if isinstance(parsed, dict) and parsed.get("status") in ("done", "limit", "error"):
             return parsed
         return None
     return None
 
 
+ERROR_DETAIL_LIMIT = 500
+
+
+def _error_detail(run_summary: dict | None) -> str:
+    """Why an agent run gave no verdict, from its last stderr line."""
+    if not run_summary:
+        return ""
+    status = run_summary.get("status")
+    if status == "error":
+        message = str(run_summary.get("message") or "").strip()
+        if message:
+            return f"The agent stopped with an error: {_fit(message, ERROR_DETAIL_LIMIT)}"
+        return "The agent stopped with an error."
+    if status == "done":
+        return "The agent finished without writing an answer."
+    return ""
+
+
 def annotate_verdict(verdict: dict, run_summary: dict | None, limit_exit: bool) -> dict:
-    """Adds the agent's usage, and marks a run ended by a limit as partial."""
+    """Adds the agent's usage, says why an ERROR verdict has no result, and
+    marks a run ended by a limit as partial."""
     annotated = dict(verdict)
     limit = None
     if run_summary:
         if isinstance(run_summary.get("usage"), dict):
             annotated["usage"] = run_summary["usage"]
         limit = run_summary.get("limit")
+    detail = _error_detail(run_summary)
+    if annotated.get("verdict") == "ERROR" and detail:
+        annotated["summary"] = f"{annotated.get('summary') or ''} {detail}".strip()
     if limit_exit or limit:
         annotated["limit"] = limit or "cost"
         if annotated.get("verdict") in ("PASS", "FAIL"):
