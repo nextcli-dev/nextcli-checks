@@ -1,13 +1,14 @@
 # Runs this repository's own .checks on its pull requests, through the
-# released reusable workflow. Changes to the scripts are covered by ci.yml.
-name: Dogfood
+# reusable workflow in this pull request, so changes to it are exercised
+# before release. Changes to the scripts are covered by ci.yml.
+name: Self checks
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
 concurrency:
-  group: dogfood-${{ github.event.pull_request.number }}
+  group: self-checks-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
