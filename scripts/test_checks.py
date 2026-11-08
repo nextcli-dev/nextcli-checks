@@ -290,24 +290,24 @@ class InstallAgentTest(unittest.TestCase):
 
     def test_default_version_is_pinned(self):
         result, calls = self.run_install()
-        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.8.0"])
-        self.assertEqual(result.stdout.strip(), "0.8.0")
+        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.8.1"])
+        self.assertEqual(result.stdout.strip(), "0.8.1")
 
     def test_agent_version_pins_nextcli(self):
         _, calls = self.run_install(CHECKS_AGENT_VERSION="0.2.0")
         self.assertEqual(calls, ["npm install -g @nextcli/cli@0.2.0"])
 
     def test_matching_installed_cn_is_kept(self):
-        self.install_cn("0.8.0")
+        self.install_cn("0.8.1")
         result, calls = self.run_install()
         self.assertEqual(calls, [])
-        self.assertEqual(result.stdout.strip(), "0.8.0")
+        self.assertEqual(result.stdout.strip(), "0.8.1")
 
     def test_mismatched_installed_cn_is_reinstalled(self):
         self.install_cn("0.1.0")
         result, calls = self.run_install()
-        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.8.0"])
-        self.assertEqual(result.stdout.strip(), "0.8.0")
+        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.8.1"])
+        self.assertEqual(result.stdout.strip(), "0.8.1")
 
     def test_commit_sha_ref_is_fetched(self):
         sha = "0123456789abcdef0123456789abcdef01234567"
