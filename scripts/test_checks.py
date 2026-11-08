@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -474,6 +475,76 @@ class RedactTest(unittest.TestCase):
                 env=env,
             )
             self.assertEqual(json.loads(verdict.read_text())["reason"], "[REDACTED]")
+
+
+class AgentExitCodeTest(unittest.TestCase):
+    """run-check.sh must turn a non-zero agent exit into a verdict, not die on it."""
+
+    NAME = "exitcode-test"
+    VALID = json.dumps(
+        {"verdict": "FAIL", "summary": "found one", "complete": False, "findings": []}
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.scripts = self.root / "scripts"
+        shutil.copytree(Path(__file__).parent, self.scripts, ignore=shutil.ignore_patterns("__pycache__"))
+        self.check = self.root / f"{self.NAME}.md"
+        self.check.write_text("---\nname: Exit code test\ndescription: x\n---\nCheck something.\n")
+        Path("/tmp/pr-truncated.diff").write_text("diff --git a/a b/a\n")
+        self.verdict = Path(f"/tmp/check-{self.NAME}.verdict.json")
+        # GNU timeout isn't on macOS. The tests don't wait, so a shim is enough.
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        shim = self.bin / "timeout"
+        shim.write_text('#!/usr/bin/env bash\nshift\nexec "$@"\n')
+        shim.chmod(0o755)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        for path in Path("/tmp").glob(f"check-{self.NAME}.*"):
+            path.unlink()
+
+    def run_check(self, exit_code: int, stdout: str = ""):
+        agent = self.scripts / "agents" / "nextcli.sh"
+        agent.write_text(f"#!/usr/bin/env bash\nprintf '%s' '{stdout}'\necho 'agent stderr' >&2\nexit {exit_code}\n")
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "CHECKS_MAX_COST": "1",
+        }
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
+            env=env, capture_output=True, text=True,
+        )
+        return result, json.loads(self.verdict.read_text())
+
+    def test_timeout_becomes_an_error_verdict(self):
+        result, verdict = self.run_check(124)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verdict["verdict"], "ERROR")
+        self.assertIn("timed out", verdict["summary"])
+
+    def test_cost_limit_without_an_answer_is_incomplete(self):
+        result, verdict = self.run_check(3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verdict["verdict"], "INCOMPLETE")
+
+    def test_cost_limit_keeps_the_answer_the_agent_gave(self):
+        result, verdict = self.run_check(3, self.VALID)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertFalse(verdict["complete"])
+
+    def test_rejected_configuration_becomes_an_error_verdict(self):
+        result, verdict = self.run_check(2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verdict["verdict"], "ERROR")
+
 
 if __name__ == "__main__":
     unittest.main()
