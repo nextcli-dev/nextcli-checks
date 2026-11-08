@@ -75,7 +75,10 @@ run_agent() {
     render_args+=(--retry)
   fi
   "${render_args[@]}" > "$prompt"
-  set +e
+  # The caller turns errexit off around this call. Don't touch it here: turning
+  # it back on before the return below would exit the whole script on any
+  # non-zero agent status (124 timeout, 3 limit, 2 bad configuration), before
+  # a verdict is written.
   # The agent gets the provider key and nothing else secret: no GitHub token
   # and no Actions runtime tokens.
   CHECKS_PROVIDER="$provider" CHECKS_MODEL="$model" \
@@ -84,9 +87,7 @@ run_agent() {
       -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL -u ACTIONS_RESULTS_URL -u ACTIONS_CACHE_URL \
       -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
       bash "$script_dir/agents/${agent}.sh" "$prompt" > "$raw" 2> "$err"
-  local code=$?
-  set -e
-  return "$code"
+  return $?
 }
 
 # Exit code of an agent that stopped at a limit (NextCLI --max-cost and
