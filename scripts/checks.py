@@ -322,6 +322,9 @@ def normalize_verdict(obj: object) -> dict | None:
     if not isinstance(obj, dict):
         return None
     verdict = obj.get("verdict")
+    # Models often write "pass" or "Fail"; the value is the same.
+    if isinstance(verdict, str):
+        verdict = verdict.strip().upper()
     if verdict not in ("PASS", "FAIL"):
         return None
     summary = obj.get("summary")

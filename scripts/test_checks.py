@@ -153,6 +153,21 @@ class ParseVerdictTest(unittest.TestCase):
     def test_invalid_returns_none(self):
         self.assertIsNone(checks.parse_verdict("not json at all"))
 
+    def test_verdict_case_does_not_matter(self):
+        # Run 42669709525: a review at its cost cap answered "pass" and was
+        # thrown away as having no verdict.
+        for written, expected in (("pass", "PASS"), (" Fail ", "FAIL")):
+            raw = json.dumps(
+                {"verdict": written, "summary": "ok", "complete": False, "findings": []}
+            )
+            parsed = checks.parse_verdict(raw)
+            self.assertEqual(parsed["verdict"], expected)
+            self.assertFalse(parsed["complete"])
+
+    def test_a_non_string_verdict_is_still_rejected(self):
+        self.assertIsNone(checks.parse_verdict('{"verdict": 1, "findings": []}'))
+        self.assertIsNone(checks.parse_verdict('{"verdict": "maybe", "findings": []}'))
+
     def test_last_valid_object_wins(self):
         raw = (
             '{"verdict":"FAIL","reason":"first","suggestions":[]}\n'
