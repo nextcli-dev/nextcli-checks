@@ -142,15 +142,32 @@ def yaml_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def render_prompt(check_body: str, diff: str, retry: bool = False) -> str:
+def render_prompt(
+    check_body: str, diff: str, retry: bool = False, empty_review: bool = False
+) -> str:
     template = (SCRIPT_DIR / "prompt.md").read_text()
     text = template.replace("@@CHECK_BODY@@", check_body).replace("@@PR_DIFF@@", diff)
-    if retry:
+    if empty_review:
+        text += (
+            "\n\nYour previous response did not review the diff in this prompt. "
+            "A path you could not read is not an empty pull request. "
+            "Review the diff above and reply with only the JSON object.\n"
+        )
+    elif retry:
         text += (
             "\n\nYour previous response was not valid JSON matching the schema. "
             "Reply with only the JSON object, with no markdown fences and no other text.\n"
         )
     return text
+
+
+def reviewed_nothing(verdict: dict, diff: str) -> bool:
+    """A finished-looking verdict that checked no file while a diff was given."""
+    if not diff.strip():
+        return False
+    if verdict.get("complete") is not False:
+        return False
+    return not verdict.get("findings")
 
 
 def _strip_fences(text: str) -> str:
@@ -370,7 +387,13 @@ def opencode_config(provider: str, model: str, api_key: str, base_url: str) -> d
     }
 
 
-def nextcli_config(provider: str, model: str, api_key: str, base_url: str) -> str:
+def nextcli_config(
+    provider: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    max_output_tokens: int | None = None,
+) -> str:
     mapped = "openai" if provider == "openai-compatible" else provider
     lines = [
         "name: AI Checks",
@@ -384,6 +407,12 @@ def nextcli_config(provider: str, model: str, api_key: str, base_url: str) -> st
     if base_url:
         lines.append(f"    apiBase: {yaml_quote(base_url)}")
     lines.extend(["    roles:", "      - chat"])
+    # Without it the provider's default applies; DeepSeek's 4,096 output tokens
+    # can be spent on thinking before the answer is written.
+    if max_output_tokens:
+        lines.extend(
+            ["    defaultCompletionOptions:", f"      maxTokens: {max_output_tokens}"]
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -674,8 +703,19 @@ def cmd_render_prompt(args: argparse.Namespace) -> int:
     text = Path(args.check).read_text()
     _frontmatter, body = parse_frontmatter(text)
     diff = Path(args.diff).read_text() if args.diff else ""
-    sys.stdout.write(render_prompt(body, diff, retry=args.retry))
+    sys.stdout.write(
+        render_prompt(body, diff, retry=args.retry, empty_review=args.retry_empty)
+    )
     return 0
+
+
+def cmd_empty_review(args: argparse.Namespace) -> int:
+    parsed = json.loads(Path(args.verdict).read_text())
+    if not isinstance(parsed, dict):
+        return 1
+    diff_path = Path(args.diff) if args.diff else None
+    diff = diff_path.read_text() if diff_path and diff_path.is_file() else ""
+    return 0 if reviewed_nothing(parsed, diff) else 1
 
 
 def cmd_parse_verdict(_args: argparse.Namespace) -> int:
@@ -716,7 +756,15 @@ def cmd_nextcli_config(_args: argparse.Namespace) -> int:
         )
     if provider == "openai-compatible" and not base_url:
         raise SystemExit("base-url is required when provider is openai-compatible.")
-    sys.stdout.write(nextcli_config(provider, model, api_key, base_url))
+    raw_cap = os.environ.get("CHECKS_MAX_OUTPUT_TOKENS", "").strip()
+    max_output_tokens = _positive_int(raw_cap) if raw_cap else None
+    if raw_cap and max_output_tokens is None:
+        raise SystemExit(
+            f"max-output-tokens must be a positive whole number, not '{raw_cap}'."
+        )
+    sys.stdout.write(
+        nextcli_config(provider, model, api_key, base_url, max_output_tokens)
+    )
     return 0
 
 
@@ -804,7 +852,13 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--check", required=True)
     render.add_argument("--diff", required=True)
     render.add_argument("--retry", action="store_true")
+    render.add_argument("--retry-empty", action="store_true")
     render.set_defaults(func=cmd_render_prompt)
+
+    empty = sub.add_parser("empty-review")
+    empty.add_argument("--verdict", required=True)
+    empty.add_argument("--diff", required=True)
+    empty.set_defaults(func=cmd_empty_review)
 
     parse = sub.add_parser("parse-verdict")
     parse.set_defaults(func=cmd_parse_verdict)

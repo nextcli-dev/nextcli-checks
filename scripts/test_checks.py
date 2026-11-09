@@ -126,6 +126,30 @@ class ParseVerdictTest(unittest.TestCase):
         self.assertIsNone(parsed["findings"][1]["line"])
         self.assertEqual(parsed["findings"][1]["title"], "Whole-file issue.")
 
+    def test_a_verdict_with_no_findings_did_not_review_a_diff(self):
+        verdict = {"verdict": "FAIL", "complete": False, "findings": []}
+        self.assertTrue(checks.reviewed_nothing(verdict, "diff --git a/a b/a\n"))
+        self.assertFalse(checks.reviewed_nothing(verdict, "   "))
+        with_findings = {
+            "verdict": "FAIL",
+            "complete": False,
+            "findings": [{"file": "a.ts", "title": "Bug", "details": "x"}],
+        }
+        self.assertFalse(
+            checks.reviewed_nothing(with_findings, "diff --git a/a b/a\n")
+        )
+        finished = {"verdict": "FAIL", "complete": True, "findings": []}
+        self.assertFalse(checks.reviewed_nothing(finished, "diff --git a/a b/a\n"))
+
+    def test_prompt_says_a_missing_path_is_not_an_empty_diff(self):
+        text = checks.render_prompt("Look for bugs.", "diff --git a/a b/a\n")
+        self.assertIn("does not depend on a tool call succeeding", text)
+        self.assertIn("diff --git a/a b/a", text)
+        retry = checks.render_prompt(
+            "Look for bugs.", "diff", empty_review=True
+        )
+        self.assertIn("did not review the diff", retry)
+
     def test_invalid_returns_none(self):
         self.assertIsNone(checks.parse_verdict("not json at all"))
 
@@ -219,6 +243,39 @@ class ConfigTest(unittest.TestCase):
         self.assertIn('model: "model \\"quoted\\""', text)
         self.assertIn('apiKey: "sk-secret"', text)
         self.assertIn('apiBase: "https://api.example.com/v1"', text)
+
+    def test_nextcli_omits_output_cap_by_default(self):
+        text = checks.nextcli_config("deepseek", "deepseek-v4.1-flash", "k", "")
+        self.assertNotIn("maxTokens", text)
+
+    def test_nextcli_writes_output_cap(self):
+        text = checks.nextcli_config(
+            "deepseek", "deepseek-v4.1-flash", "k", "", max_output_tokens=32000
+        )
+        self.assertIn("    defaultCompletionOptions:\n      maxTokens: 32000\n", text)
+
+    def test_nextcli_config_reads_output_cap_from_env(self):
+        env = {
+            **os.environ,
+            "CHECKS_PROVIDER": "deepseek",
+            "CHECKS_MODEL": "deepseek-v4.1-flash",
+            "PROVIDER_API_KEY": "k",
+            "CHECKS_MAX_OUTPUT_TOKENS": "32000",
+        }
+        result = subprocess.run(
+            ["python3", "-I", str(MODULE_PATH), "nextcli-config"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("maxTokens: 32000", result.stdout)
+
+        env["CHECKS_MAX_OUTPUT_TOKENS"] = "lots"
+        result = subprocess.run(
+            ["python3", "-I", str(MODULE_PATH), "nextcli-config"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("max-output-tokens", result.stderr)
 
     def test_conclusion(self):
         self.assertEqual(checks.conclusion_for("PASS", "neutral"), "success")
@@ -576,10 +633,25 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "INCOMPLETE")
 
     def test_cost_limit_keeps_the_answer_the_agent_gave(self):
-        result, verdict = self.run_check(3, self.VALID)
+        answer = json.dumps(
+            {
+                "verdict": "FAIL",
+                "summary": "found one",
+                "complete": False,
+                "findings": [{"file": "a.ts", "title": "Bug", "details": "x"}],
+            }
+        )
+        result, verdict = self.run_check(3, answer)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(verdict["verdict"], "FAIL")
         self.assertFalse(verdict["complete"])
+        self.assertEqual(len(verdict["findings"]), 1)
+
+    def test_unfinished_verdict_with_no_findings_is_not_a_review(self):
+        result, verdict = self.run_check(3, self.VALID)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verdict["verdict"], "INCOMPLETE")
+        self.assertIn("did not review the diff", verdict["summary"])
 
     def test_rejected_configuration_becomes_an_error_verdict(self):
         result, verdict = self.run_check(2)
