@@ -141,7 +141,7 @@ Leave `base-url` empty for a named provider unless you need a gateway. Set `CHEC
 
 ### Inputs
 
-The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-cost`, `max-output-tokens`, `check`, `base-url`, `checks-dir`, `pr-number`, `timeout-per-check` and `on-error`, and the `api-key` secret. `check` limits the matrix to one check and fails if that check does not exist. `max-cost` is a dollar cap per check (default `1`); it is enforced by `nextcli` and other agents print a notice that they ignore it. A run that exits at the cap is not retried. A `nextcli` run that ends without a verdict is retried once with what it left of the cap, so a review costs at most one cap. With `mode: comment` the action renders the combined comment from downloaded verdict files. `mode: list` only outputs the check names as a JSON array.
+The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-cost`, `max-output-tokens`, `check`, `checks`, `base-url`, `checks-dir`, `pr-number`, `timeout-per-check` and `on-error`, and the `api-key` secret. `check` limits the matrix to one check and fails if that check does not exist. `checks` limits it to a comma-separated list of checks and fails if one does not exist; use it with a repository variable to control what a run costs. `max-cost` is a dollar cap per check (default `1`); it is enforced by `nextcli` and other agents print a notice that they ignore it. A run that exits at the cap is not retried. A `nextcli` run that ends without a verdict is retried once with what it left of the cap, so a review costs at most one cap. With `mode: comment` the action renders the combined comment from downloaded verdict files. `mode: list` only outputs the check names as a JSON array.
 
 | Input | Default | Description |
 | --- | --- | --- |
@@ -155,6 +155,7 @@ The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-
 | `max-diff-bytes` | `100000` | Maximum number of PR diff bytes passed to the agent. |
 | `on-error` | `neutral` | Check-run conclusion when the agent output cannot be parsed: `neutral` or `failure`. |
 | `check` | empty | Run only this check (the file name without `.md`). |
+| `checks` | empty | Run only these checks, comma-separated (file names without `.md`). Empty runs all. Ignored when `check` is set. |
 | `checks-dir` | `.checks` | Directory of check markdown files, relative to the repository root, read from the base commit. |
 | `pr-number` | event's PR | Pull request to check. Required when the workflow is not triggered by a pull request. |
 | `mode` | `run` | `run` runs and reports checks. `comment` posts or updates the combined pull request comment. `list` only sets the `checks` output. |
