@@ -52,7 +52,7 @@ inputs:
     required: false
     default: ""
   timeout-per-check:
-    description: Minutes allowed for each check before it is reported as an error.
+    description: Minutes allowed for each check, its retry included, before it is reported as an error.
     required: false
     default: "10"
   max-diff-bytes:

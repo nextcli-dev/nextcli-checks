@@ -32,6 +32,12 @@ python3 "$script_dir/../checks.py" nextcli-config > "$config"
 # The key is in the config file now. Keep it out of the agent's environment.
 unset PROVIDER_API_KEY
 
+# One trace line per model call: tokens, cost, timings, finish reason, answer
+# and reasoning length, tool names. No prompt or answer text. NextCLI 0.9.0+.
+if [ -n "${CHECKS_TRACE_DIR:-}" ]; then
+  export NEXTCLI_TRACE=basic NEXTCLI_TRACE_DIR="$CHECKS_TRACE_DIR"
+fi
+
 # --readonly in headless mode: read, search and list only. No shell, no MCP
 # tools and no Fetch. At --max-cost the agent gives a final answer and exits 3.
 args=(-p --format json --readonly --config "$config")

@@ -596,6 +596,71 @@ class SessionReportTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("2 model calls (0 discarded)", result.stdout)
 
+    def test_reads_a_nextcli_trace(self):
+        # NEXTCLI_TRACE=basic in NextCLI 0.9.0: a header, then one event per call
+        trace = [
+            {"ts": 1, "name": "header", "attrs": {"version": "0.9.0"}},
+            {"ts": 2, "dur": 5000, "name": "llm.request", "attrs": {
+                "model": "m", "usage": {"prompt_tokens": 30000, "completion_tokens": 400,
+                                        "prompt_tokens_details": {"cached_tokens": 1000}},
+                "costUsd": 0.01, "priced": "exact", "finishReason": "tool_calls",
+                "contentChars": 0, "reasoningChars": 900, "toolCalls": ["Read"]}},
+            {"ts": 3, "dur": 2000, "name": "llm.request", "attrs": {
+                "model": "m", "usage": {"prompt_tokens": 31000, "completion_tokens": 420},
+                "costUsd": 0.0095, "finishReason": "stop", "contentChars": 0,
+                "reasoningChars": 1500}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "check.calls.jsonl"
+            log.write_text("".join(json.dumps(e) + "\n" for e in trace))
+            calls = checks.read_call_log(log)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["prompt_tokens"], 30000)
+        self.assertEqual(calls[0]["cached_tokens"], 1000)
+        self.assertEqual(calls[0]["tool_calls"], ["Read"])
+        self.assertEqual(calls[1]["finish_reason"], "stop")
+        self.assertEqual(calls[1]["content_chars"], 0)
+        report = checks.session_report(calls)
+        self.assertIn("2 model calls (0 discarded)", report)
+        self.assertIn("61,000 prompt", report)
+        self.assertIn("$0.02", report)
+
+
+class RetryBudgetTest(unittest.TestCase):
+    def test_leaves_what_the_first_run_did_not_spend(self):
+        summary = {"status": "error", "usage": {"cost": 0.01955}}
+        remaining, spent = checks.retry_budget(summary, 2.0)
+        self.assertAlmostEqual(remaining, 1.98045)
+        self.assertAlmostEqual(spent, 0.01955)
+
+    def test_no_retry_without_a_known_cost(self):
+        self.assertIsNone(checks.retry_budget(None, 2.0))
+        self.assertIsNone(checks.retry_budget({"status": "error"}, 2.0))
+        self.assertIsNone(checks.retry_budget({"status": "error", "usage": {"cost": "x"}}, 2.0))
+
+    def test_no_retry_when_little_is_left(self):
+        self.assertIsNone(checks.retry_budget({"status": "error", "usage": {"cost": 1.9}}, 2.0))
+
+    def test_command_rounds_the_budget_down(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err = Path(tmp) / "check.err"
+            err.write_text('noise\n{"status":"error","message":"x","usage":{"cost":0.00005}}\n')
+            result = subprocess.run(
+                ["python3", "-I", str(MODULE_PATH), "retry-budget", "--stderr", str(err), "--max-cost", "1"],
+                capture_output=True, text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), ["0.9999", "0.000050"])
+
+    def test_annotate_adds_the_earlier_run_to_the_cost(self):
+        annotated = checks.annotate_verdict(
+            {"verdict": "PASS", "summary": "ok", "complete": True, "findings": []},
+            {"status": "done", "usage": {"cost": 0.5, "priced": "exact"}},
+            False,
+            0.25,
+        )
+        self.assertEqual(annotated["usage"]["cost"], 0.75)
+
 
 class RedactTest(unittest.TestCase):
     def test_redacts_every_occurrence(self):
@@ -654,7 +719,10 @@ class AgentExitCodeTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
         for path in Path("/tmp").glob(f"check-{self.NAME}.*"):
-            path.unlink()
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
 
     def run_check(self, exit_code: int, stdout: str = ""):
         agent = self.scripts / "agents" / "nextcli.sh"
@@ -709,6 +777,62 @@ class AgentExitCodeTest(unittest.TestCase):
         result, verdict = self.run_check(2)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(verdict["verdict"], "ERROR")
+
+    def run_twice(self, first_cost: float, timeout: str = "10"):
+        """An agent whose first run errors at `first_cost` and whose second run
+        answers. Returns the result, the verdict and the --max-cost of each run."""
+        answer = json.dumps(
+            {"verdict": "FAIL", "summary": "found one", "complete": True,
+             "findings": [{"file": "a.ts", "title": "Bug", "details": "x"}]}
+        )
+        runs = self.root / "runs"
+        agent = self.scripts / "agents" / "nextcli.sh"
+        agent.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo \"$CHECKS_MAX_COST\" >> '{runs}'\n"
+            f"if [ \"$(wc -l < '{runs}')\" -eq 1 ]; then\n"
+            f"  echo '{{\"status\":\"error\",\"message\":\"The model finished without writing an answer.\",\"usage\":{{\"cost\":{first_cost}}}}}' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            f"printf '%s' '{answer}'\n"
+            "echo '{\"status\":\"done\",\"limit\":null,\"usage\":{\"cost\":0.3}}' >&2\n"
+        )
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "CHECKS_MAX_COST": "2",
+            "CHECKS_TIMEOUT": timeout,
+        }
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
+            env=env, capture_output=True, text=True,
+        )
+        return result, json.loads(self.verdict.read_text()), runs.read_text().split()
+
+    def test_error_is_not_retried_without_time_left(self):
+        # A zero-minute limit leaves nothing for a retry after the first run
+        result, verdict, limits = self.run_twice(0.5, timeout="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "ERROR")
+        self.assertIn("too little", result.stdout)
+
+    def test_error_is_retried_with_the_budget_left(self):
+        result, verdict, limits = self.run_twice(0.5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2", "1.5000"])
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertAlmostEqual(verdict["usage"]["cost"], 0.8)
+
+    def test_error_is_not_retried_when_little_budget_is_left(self):
+        result, verdict, limits = self.run_twice(1.9)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "ERROR")
+        self.assertIn("finished without writing an answer", verdict["summary"])
 
 
 if __name__ == "__main__":

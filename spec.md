@@ -325,7 +325,7 @@ The runner is the composite action in [`action.yml`](./action.yml). A caller pas
 
 The workflow in [`.github/workflows/checks.yml`](./.github/workflows/checks.yml) is the parallel form: one job per check file, with the agent install cached. A one-step workflow that runs every check in a single job is in the README. Each check completes a status check. One pull request comment, edited in place, holds every result: verdict, summary, and findings that link to the file and line. There are no inline suggestion comments.
 
-`max-cost` (default `1`) is the dollar cap per check. `nextcli` enforces it with `--max-cost` and, when the cap is reached, still returns a result. The comment marks that review partial (`complete: false`, or verdict `INCOMPLETE` when the agent stopped before a verdict). A run with a cap is not retried. Other agents print a notice and ignore the cap.
+`max-cost` (default `1`) is the dollar cap per check. `nextcli` enforces it with `--max-cost` and, when the cap is reached, still returns a result. The comment marks that review partial (`complete: false`, or verdict `INCOMPLETE` when the agent stopped before a verdict). A run that reached the cap is not retried. A `nextcli` run that ended without a verdict (an error, or no answer) is retried once with `--max-cost` set to what it left of the cap, if that is at least 10% of the cap, and the reported cost covers both runs. Other agents print a notice and ignore the cap.
 
 When a check passes, its section of the comment says so. A failing check lists findings in the same comment. A later run updates that comment instead of adding another. An earlier v2 "changes requested" review is dismissed.
 

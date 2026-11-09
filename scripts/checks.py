@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import math
 import os
 import re
 import sys
@@ -617,14 +618,24 @@ def _error_detail(run_summary: dict | None) -> str:
     return ""
 
 
-def annotate_verdict(verdict: dict, run_summary: dict | None, limit_exit: bool) -> dict:
+def annotate_verdict(
+    verdict: dict,
+    run_summary: dict | None,
+    limit_exit: bool,
+    spent_before: float = 0.0,
+) -> dict:
     """Adds the agent's usage, says why an ERROR verdict has no result, and
-    marks a run ended by a limit as partial."""
+    marks a run ended by a limit as partial. `spent_before` is what an earlier
+    run of the same check cost, so the reported cost covers both runs."""
     annotated = dict(verdict)
     limit = None
     if run_summary:
         if isinstance(run_summary.get("usage"), dict):
-            annotated["usage"] = run_summary["usage"]
+            usage = dict(run_summary["usage"])
+            cost = usage.get("cost")
+            if spent_before and isinstance(cost, (int, float)):
+                usage["cost"] = round(cost + spent_before, 6)
+            annotated["usage"] = usage
         limit = run_summary.get("limit")
     detail = _error_detail(run_summary)
     if annotated.get("verdict") == "ERROR" and detail:
@@ -814,14 +825,44 @@ def cmd_annotate(args: argparse.Namespace) -> int:
     if args.stderr and Path(args.stderr).is_file():
         stderr_text = Path(args.stderr).read_text(errors="replace")
     annotated = annotate_verdict(
-        verdict, read_run_summary(stderr_text), args.limit_exit
+        verdict, read_run_summary(stderr_text), args.limit_exit, args.spent_before
     )
     path.write_text(json.dumps(annotated))
     return 0
 
 
+def _call_from_trace(event: dict) -> dict | None:
+    """One NEXTCLI_TRACE=basic event as a call record, or None for other events.
+
+    NextCLI 0.9.0 writes {"ts", "dur", "name": "llm.request", "attrs": {...}}
+    with the provider's usage as sent and camelCase call fields.
+    """
+    if event.get("name") != "llm.request":
+        return None
+    attrs = event.get("attrs") if isinstance(event.get("attrs"), dict) else {}
+    usage = attrs.get("usage") if isinstance(attrs.get("usage"), dict) else {}
+    details = usage.get("prompt_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    cost = attrs.get("costUsd")
+    return {
+        "model": attrs.get("model"),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "cached_tokens": details.get("cached_tokens", details.get("cache_read_tokens")),
+        "cost_cents": cost * 100 if isinstance(cost, (int, float)) else None,
+        "duration_ms": event.get("dur"),
+        "finish_reason": attrs.get("finishReason"),
+        "content_chars": attrs.get("contentChars"),
+        "reasoning_chars": attrs.get("reasoningChars"),
+        "tool_calls": attrs.get("toolCalls") or [],
+        "discarded": bool(attrs.get("discarded")),
+        "error": attrs.get("error"),
+    }
+
+
 def read_call_log(path: Path) -> list[dict]:
-    """The JSON lines NextCLI writes to <session>.calls.jsonl, one per call."""
+    """One record per model call, from NextCLI's trace (NEXTCLI_TRACE=basic)
+    or from a log of flat call records."""
     calls = []
     for line in path.read_text(errors="replace").splitlines():
         line = line.strip()
@@ -831,9 +872,51 @@ def read_call_log(path: Path) -> list[dict]:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(record, dict):
+        if not isinstance(record, dict):
+            continue
+        if "name" in record and "attrs" in record:
+            call = _call_from_trace(record)
+            if call is not None:
+                calls.append(call)
+        else:
             calls.append(record)
     return calls
+
+
+# A retry needs at least this share of the cost limit left to be worth running.
+RETRY_MIN_BUDGET_SHARE = 0.1
+
+
+def retry_budget(run_summary: dict | None, max_cost: float) -> tuple[float, float] | None:
+    """(budget left, spent) for a retry of a run with a cost limit, or None when
+    the first run's cost is unknown or too little of the limit is left."""
+    if not run_summary or max_cost <= 0:
+        return None
+    usage = run_summary.get("usage")
+    cost = usage.get("cost") if isinstance(usage, dict) else None
+    if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0:
+        return None
+    remaining = max_cost - cost
+    if remaining < max_cost * RETRY_MIN_BUDGET_SHARE:
+        return None
+    return remaining, float(cost)
+
+
+def cmd_retry_budget(args: argparse.Namespace) -> int:
+    stderr_text = ""
+    if Path(args.stderr).is_file():
+        stderr_text = Path(args.stderr).read_text(errors="replace")
+    try:
+        max_cost = float(args.max_cost)
+    except ValueError:
+        return 1
+    budget = retry_budget(read_run_summary(stderr_text), max_cost)
+    if budget is None:
+        return 1
+    remaining, spent = budget
+    # Round the budget down so the two runs together stay within the limit.
+    print(f"{math.floor(remaining * 10000) / 10000:.4f} {spent:.6f}")
+    return 0
 
 
 def _tool_results(session: dict) -> list[tuple[str, str, int]]:
@@ -1003,7 +1086,16 @@ def build_parser() -> argparse.ArgumentParser:
     annotate.add_argument("--verdict", required=True)
     annotate.add_argument("--stderr")
     annotate.add_argument("--limit-exit", action="store_true")
+    annotate.add_argument("--spent-before", type=float, default=0.0)
     annotate.set_defaults(func=cmd_annotate)
+
+    budget = sub.add_parser(
+        "retry-budget",
+        help="Print the cost budget left for a retry and what the first run spent, or exit 1 if a retry should not run.",
+    )
+    budget.add_argument("--stderr", required=True)
+    budget.add_argument("--max-cost", required=True)
+    budget.set_defaults(func=cmd_retry_budget)
 
     report = sub.add_parser(
         "session-report",
