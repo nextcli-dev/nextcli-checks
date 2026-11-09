@@ -43,6 +43,10 @@ inputs:
     description: US dollars one check may spend, for the nextcli agent. Near the limit the agent stops and reports what it found so far, and the comment marks the review as partial. Empty for no limit. Other agents ignore it.
     required: false
     default: "1"
+  max-output-tokens:
+    description: Output tokens one model call may produce, thinking included, for the nextcli agent. Empty uses the provider's default, which is 4,096 on DeepSeek and can be used up by thinking before the answer is written.
+    required: false
+    default: ""
   results-dir:
     description: In comment mode, the directory that holds the check-*.verdict.json files from the run jobs, usually their downloaded check-results artifacts.
     required: false
@@ -199,6 +203,7 @@ runs:
         CHECKS_BASE_URL: ${{ inputs.base-url }}
         CHECKS_TIMEOUT: ${{ inputs.timeout-per-check }}
         CHECKS_MAX_COST: ${{ inputs.max-cost }}
+        CHECKS_MAX_OUTPUT_TOKENS: ${{ inputs.max-output-tokens }}
         CHECKS_ON_ERROR: ${{ inputs.on-error }}
         CHECKS_ONLY: ${{ inputs.check }}
         CHECKS_DIR: ${{ github.workspace }}/.nextcli-checks-base/${{ inputs.checks-dir }}

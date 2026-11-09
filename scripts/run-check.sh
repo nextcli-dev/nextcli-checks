@@ -73,6 +73,8 @@ run_agent() {
   local render_args=(python3 "$script_dir/checks.py" render-prompt --check "$check_file" --diff /tmp/pr-truncated.diff)
   if [ "${1:-}" = "retry" ]; then
     render_args+=(--retry)
+  elif [ "${1:-}" = "retry-empty" ]; then
+    render_args+=(--retry-empty)
   fi
   "${render_args[@]}" > "$prompt"
   # The caller turns errexit off around this call. Don't touch it here: turning
@@ -104,10 +106,15 @@ if [ -n "${CHECKS_MAX_COST:-}" ]; then
   fi
 fi
 
+# Set when the parsed verdict has no findings and did not finish, while the
+# diff is non-empty. That is not a review of the change.
+review_was_empty=false
+
 # Turns one agent run into a verdict file. Returns 1 when the output has no
 # verdict and the run may be retried.
 judge_run() {
   local code="$1"
+  review_was_empty=false
   if [ "$code" -eq 124 ]; then
     write_error_verdict "The check timed out after ${timeout_minutes} minutes."
   elif [ "$code" -eq 2 ]; then
@@ -115,6 +122,10 @@ judge_run() {
     message="$(tail -n 1 "$err" 2>/dev/null || true)"
     write_error_verdict "${message:-The agent rejected this provider configuration.}"
   elif bash "$script_dir/parse-verdict.sh" < "$raw" > "$verdict_file"; then
+    if python3 "$script_dir/checks.py" empty-review --verdict "$verdict_file" --diff /tmp/pr-truncated.diff; then
+      review_was_empty=true
+      return 1
+    fi
     return 0
   elif [ "$code" -eq "$LIMIT_EXIT" ]; then
     write_verdict INCOMPLETE "The agent stopped at its cost limit (\$${CHECKS_MAX_COST:-?}) before it returned a result."
@@ -130,7 +141,20 @@ code=$?
 set -e
 
 if ! judge_run "$code"; then
-  if [ "$retry_allowed" = true ]; then
+  if [ "$review_was_empty" = true ]; then
+    # A cost limit does not block this retry: the first result reviewed nothing.
+    set +e
+    run_agent retry-empty
+    code=$?
+    set -e
+    if ! judge_run "$code"; then
+      if [ "$review_was_empty" = true ]; then
+        write_verdict INCOMPLETE "The agent did not review the diff."
+      else
+        write_error_verdict "The agent did not return a valid verdict."
+      fi
+    fi
+  elif [ "$retry_allowed" = true ]; then
     set +e
     run_agent retry
     code=$?

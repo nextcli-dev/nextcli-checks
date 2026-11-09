@@ -140,13 +140,14 @@ Leave `base-url` empty for a named provider unless you need a gateway. Set `CHEC
 
 ### Inputs
 
-The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-cost`, `check`, `base-url`, `checks-dir`, `pr-number`, `timeout-per-check` and `on-error`, and the `api-key` secret. `check` limits the matrix to one check and fails if that check does not exist. `max-cost` is a dollar cap per check (default `1`); it is enforced by `nextcli` and other agents print a notice that they ignore it. A run that exits at the cap is not retried, so a review costs about one cap. With `mode: comment` the action renders the combined comment from downloaded verdict files. `mode: list` only outputs the check names as a JSON array.
+The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-cost`, `max-output-tokens`, `check`, `base-url`, `checks-dir`, `pr-number`, `timeout-per-check` and `on-error`, and the `api-key` secret. `check` limits the matrix to one check and fails if that check does not exist. `max-cost` is a dollar cap per check (default `1`); it is enforced by `nextcli` and other agents print a notice that they ignore it. A run that exits at the cap is not retried, so a review costs about one cap. With `mode: comment` the action renders the combined comment from downloaded verdict files. `mode: list` only outputs the check names as a JSON array.
 
 | Input | Default | Description |
 | --- | --- | --- |
 | `agent` | `opencode` | Agent CLI that runs each check: `opencode`, `nextcli`, or `claude-code`. |
 | `agent-version` | empty | Version of the agent CLI to install. Defaults to `opencode-ai` 1.19.5, `@anthropic-ai/claude-code` 2.1.312, or `@nextcli/cli` 0.8.1. An installed `cn` at another version is replaced. |
 | `max-cost` | `1` | Dollar cap per check. `nextcli` stops at the cap and still returns a result; the comment marks that review partial. Other agents ignore it. |
+| `max-output-tokens` | empty | Output tokens one model call may produce, thinking included (`nextcli` only). Empty uses the provider's default, which is 4,096 on DeepSeek and can be used up by thinking before the answer. |
 | `nextcli-ref` | empty | Branch, tag, or commit SHA of NextCLI to build from source when `agent` is `nextcli`. When set, `agent-version` is ignored for `nextcli`. |
 | `nextcli-repository` | `https://github.com/nextcli-dev/nextcli.git` | Repository cloned when `nextcli-ref` is set. |
 | `timeout-per-check` | `10` | Minutes allowed for each check before it is reported as an error. |

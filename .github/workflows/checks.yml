@@ -43,6 +43,10 @@ on:
         description: US dollars one check may spend (nextcli only). Near the limit the agent reports what it found so far. Empty for no limit.
         type: string
         default: "1"
+      max-output-tokens:
+        description: Output tokens one model call may produce, thinking included (nextcli only). Empty uses the provider's default (4,096 on DeepSeek).
+        type: string
+        default: ""
       check:
         description: Run only this check (file name without .md). Empty runs every check in checks-dir.
         type: string
@@ -149,6 +153,7 @@ jobs:
           base-url: ${{ inputs.base-url }}
           api-key: ${{ secrets.api-key }}
           max-cost: ${{ inputs.max-cost }}
+          max-output-tokens: ${{ inputs.max-output-tokens }}
           timeout-per-check: ${{ inputs.timeout-per-check }}
           on-error: ${{ inputs.on-error }}
 
