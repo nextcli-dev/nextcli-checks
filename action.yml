@@ -229,7 +229,7 @@ runs:
       env:
         PROVIDER_API_KEY: ${{ inputs.api-key }}
         GH_TOKEN: ${{ github.token }}
-      run: python3 "$GITHUB_ACTION_PATH/scripts/checks.py" redact /tmp/check-*.json /tmp/check-*.err
+      run: python3 "$GITHUB_ACTION_PATH/scripts/checks.py" redact /tmp/check-*.json /tmp/check-*.err /tmp/check-*.calls.jsonl
 
     - name: Upload check outputs
       if: always() && inputs.mode == 'run' && steps.bot.outputs.skip != 'true'
@@ -239,6 +239,7 @@ runs:
         path: |
           /tmp/check-*.json
           /tmp/check-*.err
+          /tmp/check-*.calls.jsonl
         retention-days: 7
         if-no-files-found: ignore
 
