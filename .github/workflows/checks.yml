@@ -16,6 +16,9 @@
 #       secrets:
 #         api-key: ${{ secrets.PROVIDER_API_KEY }}
 #
+# Set `checks: anti-slop,review` to run only those checks, for example from a
+# repository variable, to control what a pull request costs.
+#
 # The jobs below use nextcli-dev/nextcli-checks@v3. Release this file and the
 # action together, and move the v3 tag for both.
 name: AI Checks
@@ -49,6 +52,10 @@ on:
         default: ""
       check:
         description: Run only this check (file name without .md). Empty runs every check in checks-dir.
+        type: string
+        default: ""
+      checks:
+        description: Comma-separated allowlist of checks to run (file names without .md). Empty runs every check in checks-dir. Ignored when check is set. Fails if a listed check does not exist.
         type: string
         default: ""
       base-url:
@@ -113,6 +120,7 @@ jobs:
         env:
           CHECKS: ${{ steps.list.outputs.checks || '[]' }}
           ONLY: ${{ inputs.check }}
+          ALLOWED: ${{ inputs.checks }}
           ENABLED: ${{ steps.config.outputs.enabled }}
         run: |
           if [ -n "$ONLY" ] && [ "$ENABLED" = "true" ]; then
@@ -121,6 +129,14 @@ jobs:
               exit 1
             fi
             CHECKS="$(jq -cn --arg c "$ONLY" '[$c]')"
+          elif [ -n "$ALLOWED" ] && [ "$ENABLED" = "true" ]; then
+            WANTED="$(printf '%s' "$ALLOWED" | jq -Rc '[split(",")[] | gsub("^\\s+|\\s+$"; "") | select(. != "")]')"
+            MISSING="$(jq -cn --argjson all "$CHECKS" --argjson want "$WANTED" '$want - $all')"
+            if [ "$MISSING" != "[]" ]; then
+              echo "::error::Checks $MISSING are not in the checks directory. Checks: $CHECKS"
+              exit 1
+            fi
+            CHECKS="$(jq -cn --argjson all "$CHECKS" --argjson want "$WANTED" '$all | map(select(. as $c | $want | index($c)))')"
           fi
           echo "checks=${CHECKS}" >> "$GITHUB_OUTPUT"
 
