@@ -831,56 +831,113 @@ def cmd_annotate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _call_from_trace(event: dict) -> dict | None:
-    """One NEXTCLI_TRACE=basic event as a call record, or None for other events.
+def _dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
 
-    NextCLI 0.9.0 writes {"ts", "dur", "name": "llm.request", "attrs": {...}}
-    with the provider's usage as sent and camelCase call fields.
-    """
-    if event.get("name") != "llm.request":
+
+def _number(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    attrs = event.get("attrs") if isinstance(event.get("attrs"), dict) else {}
-    usage = attrs.get("usage") if isinstance(attrs.get("usage"), dict) else {}
-    details = usage.get("prompt_tokens_details")
-    details = details if isinstance(details, dict) else {}
-    cost = attrs.get("costUsd")
+    return value
+
+
+def _call_from_trace(event: dict) -> dict:
+    """One `llm.request` event of NextCLI's NEXTCLI_TRACE=basic trace.
+
+    The event is {"ts", "dur", "name", "attrs"}. `attrs.usage` is the
+    provider's usage as sent; the other attrs are cn's camelCase call fields.
+    A call that failed before streaming has `error` (and `status`) but no usage.
+    """
+    attrs = _dict(event.get("attrs"))
+    usage = _dict(attrs.get("usage"))
+    prompt_details = _dict(usage.get("prompt_tokens_details"))
+    completion_details = _dict(usage.get("completion_tokens_details"))
     return {
         "model": attrs.get("model"),
-        "prompt_tokens": usage.get("prompt_tokens"),
-        "completion_tokens": usage.get("completion_tokens"),
-        "cached_tokens": details.get("cached_tokens", details.get("cache_read_tokens")),
-        "cost_cents": cost * 100 if isinstance(cost, (int, float)) else None,
-        "duration_ms": event.get("dur"),
+        "prompt_tokens": _number(usage.get("prompt_tokens")),
+        "completion_tokens": _number(usage.get("completion_tokens")),
+        "cached_tokens": _number(
+            prompt_details.get("cached_tokens", prompt_details.get("cache_read_tokens"))
+        ),
+        # Providers that hide or encrypt reasoning still count its tokens here
+        "reasoning_tokens": _number(completion_details.get("reasoning_tokens")),
+        "cost_usd": _number(attrs.get("costUsd")),
+        "priced": attrs.get("priced"),
+        "duration_ms": _number(event.get("dur")),
+        "ttft_ms": _number(attrs.get("ttftMs")),
         "finish_reason": attrs.get("finishReason"),
-        "content_chars": attrs.get("contentChars"),
-        "reasoning_chars": attrs.get("reasoningChars"),
-        "tool_calls": attrs.get("toolCalls") or [],
+        "content_chars": _number(attrs.get("contentChars")),
+        "reasoning_chars": _number(attrs.get("reasoningChars")),
+        "tool_calls": [t for t in attrs.get("toolCalls") or [] if isinstance(t, str)],
         "discarded": bool(attrs.get("discarded")),
-        "error": attrs.get("error"),
+        "aborted": bool(attrs.get("aborted")),
+        "error": attrs.get("error") if isinstance(attrs.get("error"), str) else None,
+        "status": _number(attrs.get("status")),
     }
 
 
-def read_call_log(path: Path) -> list[dict]:
-    """One record per model call, from NextCLI's trace (NEXTCLI_TRACE=basic)
-    or from a log of flat call records."""
-    calls = []
+def read_trace(path: Path) -> list[dict]:
+    """The runs in a file of NextCLI traces, oldest first.
+
+    Each cn process writes its own file that starts with a `header` event, and
+    run-check.sh concatenates them (a check and its retry), so a header starts
+    a run: {"run_id", "version", "started", "calls": [...]}. Lines that are not
+    JSON objects, and events other than `header` and `llm.request`, are skipped.
+    """
+    runs: list[dict] = []
     for line in path.read_text(errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            record = json.loads(line)
+            event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(record, dict):
+        if not isinstance(event, dict):
             continue
-        if "name" in record and "attrs" in record:
-            call = _call_from_trace(record)
-            if call is not None:
-                calls.append(call)
-        else:
-            calls.append(record)
-    return calls
+        name = event.get("name")
+        if name == "header":
+            attrs = _dict(event.get("attrs"))
+            runs.append(
+                {
+                    "run_id": attrs.get("runId"),
+                    "version": attrs.get("version"),
+                    "started": _number(event.get("ts")),
+                    "calls": [],
+                }
+            )
+        elif name == "llm.request":
+            if not runs:
+                runs.append({"run_id": None, "version": None, "started": _number(event.get("ts")), "calls": []})
+            runs[-1]["calls"].append(_call_from_trace(event))
+    # The files are concatenated in name order (session id), not in time order
+    runs.sort(key=lambda run: run["started"] if run["started"] is not None else math.inf)
+    return runs
+
+
+def run_ending(calls: list[dict]) -> str | None:
+    """How a run's last model call ended, when that explains a missing answer."""
+    kept = [call for call in calls if not call["discarded"]]
+    if not kept:
+        return None
+    last = kept[-1]
+    if last["error"]:
+        status = f" {last['status']}" if last["status"] is not None else ""
+        return f"The last call failed with a provider error{status}."
+    if last["aborted"]:
+        return "The last call was stopped."
+    if last["finish_reason"] == "length":
+        return f"The last call was cut off at the output cap ({_n(last['completion_tokens'])} completion tokens)."
+    if last["content_chars"] or last["tool_calls"]:
+        return None
+    thought = [
+        f"{_n(value)} reasoning {unit}"
+        for value, unit in ((last["reasoning_chars"], "chars"), (last["reasoning_tokens"], "tokens"))
+        if value
+    ]
+    if thought:
+        return f"The last call returned no answer and no tool calls after thinking ({', '.join(thought)})."
+    return "The last call returned nothing: no answer, no tool calls and no reasoning."
 
 
 # A retry needs at least this share of the cost limit left to be worth running.
@@ -949,31 +1006,72 @@ def _n(value: object) -> str:
     return f"{value:,}" if isinstance(value, (int, float)) else "-"
 
 
-def session_report(calls: list[dict], session: dict | None = None) -> str:
-    """A per-call table of one check run, plus what its tools returned."""
-    kept = [call for call in calls if not call.get("discarded")]
-    total = lambda key: sum(c.get(key) or 0 for c in calls)  # noqa: E731
-    lines = [
+def _seconds(ms: object) -> str:
+    return f"{ms / 1000:.1f}" if isinstance(ms, (int, float)) else "-"
+
+
+def _outcome(call: dict) -> str:
+    if call["error"]:
+        status = f" {call['status']}" if call["status"] is not None else ""
+        outcome = f"error{status}: {_fit(call['error'], 80)}"
+        return f"discarded, {outcome}" if call["discarded"] else outcome
+    if call["discarded"]:
+        return "discarded"
+    if call["aborted"]:
+        return "aborted"
+    return ""
+
+
+def _totals(calls: list[dict]) -> str:
+    kept = [call for call in calls if not call["discarded"]]
+    total = lambda key: sum(call[key] or 0 for call in calls)  # noqa: E731
+    return (
         f"{len(kept)} model calls ({len(calls) - len(kept)} discarded), "
         f"{_n(total('prompt_tokens'))} prompt, {_n(total('completion_tokens'))} completion, "
-        f"{_n(total('cached_tokens'))} cached tokens, ${total('cost_cents') / 100:.2f}, "
-        f"{total('duration_ms') / 1000:.0f} s in model calls",
-        "",
-        "  # | prompt     | completion | cached     | seconds | finish     | answer | reasoning | tools",
-    ]
-    for index, call in enumerate(calls, 1):
-        tools = call.get("tool_calls") or []
-        lines.append(
-            f"{index:>3} | {_n(call.get('prompt_tokens')):>10} | {_n(call.get('completion_tokens')):>10} | "
-            f"{_n(call.get('cached_tokens')):>10} | {(call.get('duration_ms') or 0) / 1000:>7.1f} | "
-            f"{str(call.get('finish_reason') or '-'):<10} | {_n(call.get('content_chars')):>6} | "
-            f"{_n(call.get('reasoning_chars')):>9} | "
-            + (", ".join(tools) if tools else "-")
-            + (" (discarded)" if call.get("discarded") else "")
-        )
+        f"{_n(total('cached_tokens'))} cached tokens, ${total('cost_usd'):.2f}, "
+        f"{total('duration_ms') / 1000:.0f} s in model calls"
+    )
+
+
+CALL_TABLE_HEADER = (
+    "  # | prompt     | completion | cached     | seconds | ttft  | finish     "
+    "| answer | reasoning      | tools | outcome"
+)
+
+
+def _call_row(index: int, call: dict) -> str:
+    reasoning = _n(call["reasoning_chars"])
+    if call["reasoning_tokens"]:
+        reasoning += f" ({_n(call['reasoning_tokens'])} tok)"
+    tools = ", ".join(call["tool_calls"]) or "-"
+    return (
+        f"{index:>3} | {_n(call['prompt_tokens']):>10} | {_n(call['completion_tokens']):>10} | "
+        f"{_n(call['cached_tokens']):>10} | {_seconds(call['duration_ms']):>7} | "
+        f"{_seconds(call['ttft_ms']):>5} | {str(call['finish_reason'] or '-'):<10} | "
+        f"{_n(call['content_chars']):>6} | {reasoning:<14} | {tools} | {_outcome(call) or '-'}"
+    )
+
+
+def session_report(runs: list[dict], session: dict | None = None) -> str:
+    """A per-call table for each run of one check, how each run ended, and
+    what the tools of the last run returned."""
+    calls = [call for run in runs for call in run["calls"]]
+    lines = [_totals(calls)]
+    for number, run in enumerate(runs, 1):
+        lines.append("")
+        if len(runs) > 1:
+            retry = " (retry)" if number > 1 else ""
+            lines += [f"Run {number}{retry}: {_totals(run['calls'])}", ""]
+        lines.append(CALL_TABLE_HEADER)
+        lines += [_call_row(index, call) for index, call in enumerate(run["calls"], 1)]
+        ending = run_ending(run["calls"])
+        if ending:
+            lines.append(ending)
     asked: dict[str, int] = {}
-    for call in kept:
-        for tool in call.get("tool_calls") or []:
+    for call in calls:
+        if call["discarded"]:
+            continue
+        for tool in call["tool_calls"]:
             asked[tool] = asked.get(tool, 0) + 1
     if asked:
         lines += ["", "Tool calls: " + ", ".join(f"{t} x{n}" for t, n in sorted(asked.items(), key=lambda kv: -kv[1]))]
@@ -1008,7 +1106,7 @@ def cmd_session_report(args: argparse.Namespace) -> int:
             session = loaded if isinstance(loaded, dict) else None
         except json.JSONDecodeError:
             session = None
-    sys.stdout.write(session_report(read_call_log(calls_path), session))
+    sys.stdout.write(session_report(read_trace(calls_path), session))
     return 0
 
 
@@ -1099,7 +1197,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = sub.add_parser(
         "session-report",
-        help="Print one check run's model calls from NextCLI's call log, and what its tools returned.",
+        help="Print a check's model calls from NextCLI's trace, run by run, and what its tools returned.",
     )
     report.add_argument("--calls", required=True)
     report.add_argument("--session")

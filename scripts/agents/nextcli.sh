@@ -33,7 +33,8 @@ python3 "$script_dir/../checks.py" nextcli-config > "$config"
 unset PROVIDER_API_KEY
 
 # One trace line per model call: tokens, cost, timings, finish reason, answer
-# and reasoning length, tool names. No prompt or answer text. NextCLI 0.9.0+.
+# and reasoning length, tool names, and the provider's error message when a
+# call fails. No prompt or answer text. A cn without tracing ignores these.
 if [ -n "${CHECKS_TRACE_DIR:-}" ]; then
   export NEXTCLI_TRACE=basic NEXTCLI_TRACE_DIR="$CHECKS_TRACE_DIR"
 fi
