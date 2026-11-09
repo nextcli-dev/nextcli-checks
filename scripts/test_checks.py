@@ -545,6 +545,58 @@ class CommentAndLimitTest(unittest.TestCase):
         self.assertEqual(annotated["summary"], "fine")
 
 
+class SessionReportTest(unittest.TestCase):
+    CALLS = [
+        {"model": "m", "prompt_tokens": 25000, "completion_tokens": 900, "cost_cents": 1,
+         "duration_ms": 4000, "finish_reason": "tool_calls", "content_chars": 0,
+         "reasoning_chars": 1200, "tool_calls": ["Read", "Read"]},
+        {"model": "m", "prompt_tokens": 31000, "completion_tokens": 300, "cost_cents": 1,
+         "duration_ms": 9000, "content_chars": 120, "reasoning_chars": 0,
+         "tool_calls": [], "discarded": True},
+        {"model": "m", "prompt_tokens": 31000, "completion_tokens": 32000, "cost_cents": 5,
+         "duration_ms": 41000, "finish_reason": "length", "content_chars": 0,
+         "reasoning_chars": 90000, "tool_calls": []},
+    ]
+
+    def _read(self, path, size):
+        return {
+            "toolCall": {"function": {"name": "Read", "arguments": json.dumps({"filepath": path})}},
+            "output": [{"content": "x" * size}],
+        }
+
+    def test_lists_each_call_and_marks_the_cut_off_one(self):
+        report = checks.session_report(self.CALLS)
+        self.assertIn("2 model calls (1 discarded)", report)
+        self.assertIn("87,000 prompt", report)
+        self.assertIn("length", report)
+        self.assertIn("(discarded)", report)
+        self.assertIn("Tool calls: Read x2", report)
+
+    def test_reports_tool_result_sizes_and_repeated_reads(self):
+        session = {"history": [{"toolCallStates": [
+            self._read("src/a.ts", 5000),
+            self._read("src/b.ts", 200),
+            self._read("src/a.ts", 5000),
+        ]}]}
+        report = checks.session_report(self.CALLS, session)
+        self.assertIn("Characters returned: Read 10,200", report)
+        self.assertIn("Largest results: Read src/a.ts 5,000", report)
+        self.assertIn("Repeated: Read src/a.ts x2", report)
+
+    def test_reads_a_call_log_and_skips_bad_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "x.calls.jsonl"
+            log.write_text(json.dumps(self.CALLS[0]) + "\nnot json\n\n" + json.dumps(self.CALLS[2]) + "\n")
+            calls = checks.read_call_log(log)
+            self.assertEqual([c["finish_reason"] for c in calls], ["tool_calls", "length"])
+            result = subprocess.run(
+                ["python3", "-I", str(MODULE_PATH), "session-report", "--calls", str(log)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("2 model calls (0 discarded)", result.stdout)
+
+
 class RedactTest(unittest.TestCase):
     def test_redacts_every_occurrence(self):
         text = 'reason: key sk-abcdef123456 leaked; again sk-abcdef123456'

@@ -171,6 +171,25 @@ if [ "$code" -eq "$LIMIT_EXIT" ]; then
 fi
 python3 "$script_dir/checks.py" annotate --verdict "$verdict_file" --stderr "$err" ${limit_args[@]+"${limit_args[@]}"}
 
+# NextCLI logs every model call next to its session. Keep that log and the
+# session (which tool calls returned what) with the results.
+calls="/tmp/check-${name}.calls.jsonl"
+session_copy="/tmp/check-${name}.session.json"
+if [ "$agent" = "nextcli" ]; then
+  sessions_dir="${CONTINUE_GLOBAL_DIR:-$HOME/.continue}/sessions"
+  cat "$sessions_dir"/*.calls.jsonl > "$calls" 2>/dev/null || rm -f "$calls"
+  newest="$(ls -t "$sessions_dir"/*.json 2>/dev/null | grep -v '/sessions\.json$' | head -n 1 || true)"
+  if [ -n "$newest" ]; then
+    cp "$newest" "$session_copy"
+  fi
+fi
+
 # Nothing the agent wrote is posted or uploaded until secrets are removed.
-python3 "$script_dir/checks.py" redact "$verdict_file" "$raw" "$err" "$prompt"
+python3 "$script_dir/checks.py" redact "$verdict_file" "$raw" "$err" "$prompt" "$calls" "$session_copy"
 bash "$script_dir/report.sh" "$name" "$verdict_file" "$check_run_id"
+
+if [ -s "$calls" ]; then
+  echo "::group::check/${name}: model calls"
+  python3 "$script_dir/checks.py" session-report --calls "$calls" --session "$session_copy" || true
+  echo "::endgroup::"
+fi

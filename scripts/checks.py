@@ -820,6 +820,115 @@ def cmd_annotate(args: argparse.Namespace) -> int:
     return 0
 
 
+def read_call_log(path: Path) -> list[dict]:
+    """The JSON lines NextCLI writes to <session>.calls.jsonl, one per call."""
+    calls = []
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            calls.append(record)
+    return calls
+
+
+def _tool_results(session: dict) -> list[tuple[str, str, int]]:
+    """(tool, main argument, characters returned) for each tool call."""
+    results = []
+    for item in session.get("history") or []:
+        for state in item.get("toolCallStates") or []:
+            function = (state.get("toolCall") or {}).get("function") or {}
+            name = function.get("name") or "?"
+            try:
+                args = json.loads(function.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            target = ""
+            if isinstance(args, dict):
+                for key in ("filepath", "path", "dirpath", "pattern", "command", "url"):
+                    if args.get(key):
+                        target = str(args[key])
+                        break
+            size = sum(
+                len(str(part.get("content") or ""))
+                for part in state.get("output") or []
+                if isinstance(part, dict)
+            )
+            results.append((name, target, size))
+    return results
+
+
+def _n(value: object) -> str:
+    return f"{value:,}" if isinstance(value, (int, float)) else "-"
+
+
+def session_report(calls: list[dict], session: dict | None = None) -> str:
+    """A per-call table of one check run, plus what its tools returned."""
+    kept = [call for call in calls if not call.get("discarded")]
+    total = lambda key: sum(c.get(key) or 0 for c in calls)  # noqa: E731
+    lines = [
+        f"{len(kept)} model calls ({len(calls) - len(kept)} discarded), "
+        f"{_n(total('prompt_tokens'))} prompt, {_n(total('completion_tokens'))} completion, "
+        f"{_n(total('cached_tokens'))} cached tokens, ${total('cost_cents') / 100:.2f}, "
+        f"{total('duration_ms') / 1000:.0f} s in model calls",
+        "",
+        "  # | prompt     | completion | cached     | seconds | finish     | answer | reasoning | tools",
+    ]
+    for index, call in enumerate(calls, 1):
+        tools = call.get("tool_calls") or []
+        lines.append(
+            f"{index:>3} | {_n(call.get('prompt_tokens')):>10} | {_n(call.get('completion_tokens')):>10} | "
+            f"{_n(call.get('cached_tokens')):>10} | {(call.get('duration_ms') or 0) / 1000:>7.1f} | "
+            f"{str(call.get('finish_reason') or '-'):<10} | {_n(call.get('content_chars')):>6} | "
+            f"{_n(call.get('reasoning_chars')):>9} | "
+            + (", ".join(tools) if tools else "-")
+            + (" (discarded)" if call.get("discarded") else "")
+        )
+    asked: dict[str, int] = {}
+    for call in kept:
+        for tool in call.get("tool_calls") or []:
+            asked[tool] = asked.get(tool, 0) + 1
+    if asked:
+        lines += ["", "Tool calls: " + ", ".join(f"{t} x{n}" for t, n in sorted(asked.items(), key=lambda kv: -kv[1]))]
+    if session:
+        results = _tool_results(session)
+        if results:
+            by_tool: dict[str, int] = {}
+            for name, _target, size in results:
+                by_tool[name] = by_tool.get(name, 0) + size
+            lines += ["Characters returned: " + ", ".join(f"{t} {_n(c)}" for t, c in sorted(by_tool.items(), key=lambda kv: -kv[1]))]
+            largest = sorted(results, key=lambda r: -r[2])[:5]
+            lines += ["Largest results: " + "; ".join(f"{name} {target or '-'} {_n(size)}" for name, target, size in largest)]
+            seen: dict[tuple[str, str], int] = {}
+            for name, target, _size in results:
+                if target:
+                    seen[(name, target)] = seen.get((name, target), 0) + 1
+            repeats = [f"{name} {target} x{count}" for (name, target), count in seen.items() if count > 1]
+            if repeats:
+                lines += ["Repeated: " + "; ".join(repeats)]
+    return "\n".join(lines) + "\n"
+
+
+def cmd_session_report(args: argparse.Namespace) -> int:
+    calls_path = Path(args.calls)
+    if not calls_path.is_file():
+        print(f"No call log at {calls_path}.", file=sys.stderr)
+        return 1
+    session = None
+    if args.session and Path(args.session).is_file():
+        try:
+            loaded = json.loads(Path(args.session).read_text(errors="replace"))
+            session = loaded if isinstance(loaded, dict) else None
+        except json.JSONDecodeError:
+            session = None
+    sys.stdout.write(session_report(read_call_log(calls_path), session))
+    return 0
+
+
 def cmd_redact(args: argparse.Namespace) -> int:
     secrets = secrets_from_env()
     for name in args.files:
@@ -895,6 +1004,14 @@ def build_parser() -> argparse.ArgumentParser:
     annotate.add_argument("--stderr")
     annotate.add_argument("--limit-exit", action="store_true")
     annotate.set_defaults(func=cmd_annotate)
+
+    report = sub.add_parser(
+        "session-report",
+        help="Print one check run's model calls from NextCLI's call log, and what its tools returned.",
+    )
+    report.add_argument("--calls", required=True)
+    report.add_argument("--session")
+    report.set_defaults(func=cmd_session_report)
 
     redact = sub.add_parser(
         "redact",
