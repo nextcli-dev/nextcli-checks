@@ -64,7 +64,7 @@ on:
         type: string
         default: ""
       timeout-per-check:
-        description: Minutes allowed per check
+        description: Minutes allowed per check, its retry included
         type: string
         default: "10"
       on-error:
@@ -129,7 +129,8 @@ jobs:
     needs: discover
     if: needs.discover.outputs.checks != '[]' && needs.discover.outputs.checks != ''
     runs-on: ubuntu-latest
-    # Covers agent install, one check, and its single retry.
+    # Covers agent install and one check. timeout-per-check covers the check's
+    # first run and its retry together, so keep it below this.
     timeout-minutes: 30
     permissions:
       contents: read

@@ -2,7 +2,8 @@
 # Run one check file. Path filters skip the agent and still publish a
 # successful check run, so a required status check does not stay pending.
 # A verdict that fails to parse is retried once. Configuration errors (exit 2)
-# and timeouts are not retried.
+# and timeouts are not retried. CHECKS_TIMEOUT covers the first run and its
+# retry together, so a check fits in the job's time limit.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +33,11 @@ raw="/tmp/check-${name}.json"
 err="/tmp/check-${name}.err"
 prompt="/tmp/check-${name}.prompt"
 verdict_file="/tmp/check-${name}.verdict.json"
+# NextCLI writes one trace line per model call here (NEXTCLI_TRACE=basic).
+trace_dir="/tmp/check-${name}.traces"
 : > "$err"
+rm -rf "$trace_dir"
+mkdir -p "$trace_dir"
 
 check_run_id=""
 if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
@@ -69,7 +74,25 @@ if [ -z "$provider" ] || [ -z "$model" ]; then
   exit 0
 fi
 
+# The first run and its retry share one time limit.
+deadline=$((SECONDS + timeout_minutes * 60))
+
+# A retry needs at least this many seconds left to be worth starting.
+MIN_RETRY_SECONDS=120
+
+time_for_retry() {
+  if [ $((deadline - SECONDS)) -ge "$MIN_RETRY_SECONDS" ]; then
+    return 0
+  fi
+  echo "::notice::check/${name} has too little of its ${timeout_minutes} minutes left for a retry."
+  return 1
+}
+
 run_agent() {
+  local seconds_left=$((deadline - SECONDS))
+  if [ "$seconds_left" -lt 1 ]; then
+    seconds_left=1
+  fi
   local render_args=(python3 "$script_dir/checks.py" render-prompt --check "$check_file" --diff /tmp/pr-truncated.diff)
   if [ "${1:-}" = "retry" ]; then
     render_args+=(--retry)
@@ -83,8 +106,8 @@ run_agent() {
   # a verdict is written.
   # The agent gets the provider key and nothing else secret: no GitHub token
   # and no Actions runtime tokens.
-  CHECKS_PROVIDER="$provider" CHECKS_MODEL="$model" \
-    timeout "${timeout_minutes}m" \
+  CHECKS_PROVIDER="$provider" CHECKS_MODEL="$model" CHECKS_TRACE_DIR="$trace_dir" \
+    timeout "${seconds_left}s" \
     env -u GH_TOKEN -u GITHUB_TOKEN \
       -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL -u ACTIONS_RESULTS_URL -u ACTIONS_CACHE_URL \
       -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
@@ -96,8 +119,9 @@ run_agent() {
 # friends). Its answer, if any, is still on stdout.
 LIMIT_EXIT=3
 
-# A second run would start a new cost budget, so a run with a cost limit is
-# not retried, whichever agent is selected. Only nextcli enforces the limit.
+# A second run starts a new cost budget. With a cost limit, only nextcli is
+# retried, and only with what the first run left of the limit (see
+# checks.py retry-budget), so both runs together stay within it.
 retry_allowed=true
 if [ -n "${CHECKS_MAX_COST:-}" ]; then
   retry_allowed=false
@@ -105,6 +129,9 @@ if [ -n "${CHECKS_MAX_COST:-}" ]; then
     echo "::notice::max-cost only applies to the nextcli agent. check/${name} runs without a cost limit."
   fi
 fi
+
+# What an earlier run of this check cost, added to the reported usage.
+spent_before=0
 
 # Set when the parsed verdict has no findings and did not finish, while the
 # diff is non-empty. That is not a review of the change.
@@ -142,21 +169,36 @@ set -e
 
 if ! judge_run "$code"; then
   if [ "$review_was_empty" = true ]; then
-    # A cost limit does not block this retry: the first result reviewed nothing.
-    set +e
-    run_agent retry-empty
-    code=$?
-    set -e
-    if ! judge_run "$code"; then
-      if [ "$review_was_empty" = true ]; then
-        write_verdict INCOMPLETE "The agent did not review the diff."
-      else
-        write_error_verdict "The agent did not return a valid verdict."
+    if ! time_for_retry; then
+      write_verdict INCOMPLETE "The agent did not review the diff."
+    else
+      # A cost limit does not block this retry: the first result reviewed nothing.
+      set +e
+      run_agent retry-empty
+      code=$?
+      set -e
+      if ! judge_run "$code"; then
+        if [ "$review_was_empty" = true ]; then
+          write_verdict INCOMPLETE "The agent did not review the diff."
+        else
+          write_error_verdict "The agent did not return a valid verdict."
+        fi
       fi
     fi
+  elif ! time_for_retry; then
+    write_error_verdict "The agent did not return a valid verdict."
   elif [ "$retry_allowed" = true ]; then
     set +e
     run_agent retry
+    code=$?
+    set -e
+    judge_run "$code" || write_error_verdict "The agent did not return a valid verdict."
+  elif [ "$agent" = "nextcli" ] && [ "$code" -ne "$LIMIT_EXIT" ] &&
+    budget="$(python3 "$script_dir/checks.py" retry-budget --stderr "$err" --max-cost "$CHECKS_MAX_COST")"; then
+    read -r retry_max_cost spent_before <<< "$budget"
+    echo "::notice::check/${name} gave no verdict; retrying with the \$${retry_max_cost} left of its \$${CHECKS_MAX_COST} cost limit."
+    set +e
+    CHECKS_MAX_COST="$retry_max_cost" run_agent retry
     code=$?
     set -e
     judge_run "$code" || write_error_verdict "The agent did not return a valid verdict."
@@ -169,15 +211,15 @@ limit_args=()
 if [ "$code" -eq "$LIMIT_EXIT" ]; then
   limit_args+=(--limit-exit)
 fi
-python3 "$script_dir/checks.py" annotate --verdict "$verdict_file" --stderr "$err" ${limit_args[@]+"${limit_args[@]}"}
+python3 "$script_dir/checks.py" annotate --verdict "$verdict_file" --stderr "$err" --spent-before "$spent_before" ${limit_args[@]+"${limit_args[@]}"}
 
-# NextCLI logs every model call next to its session. Keep that log and the
+# NextCLI traces every model call (NEXTCLI_TRACE=basic). Keep that log and the
 # session (which tool calls returned what) with the results.
 calls="/tmp/check-${name}.calls.jsonl"
 session_copy="/tmp/check-${name}.session.json"
 if [ "$agent" = "nextcli" ]; then
   sessions_dir="${CONTINUE_GLOBAL_DIR:-$HOME/.continue}/sessions"
-  cat "$sessions_dir"/*.calls.jsonl > "$calls" 2>/dev/null || rm -f "$calls"
+  cat "$trace_dir"/*.jsonl > "$calls" 2>/dev/null || rm -f "$calls"
   newest="$(ls -t "$sessions_dir"/*.json 2>/dev/null | grep -v '/sessions\.json$' | head -n 1 || true)"
   if [ -n "$newest" ]; then
     cp "$newest" "$session_copy"

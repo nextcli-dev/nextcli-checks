@@ -545,17 +545,38 @@ class CommentAndLimitTest(unittest.TestCase):
         self.assertEqual(annotated["summary"], "fine")
 
 
+def _event(ts, **attrs):
+    return {"ts": ts, "dur": attrs.pop("dur", 1000), "name": "llm.request", "attrs": attrs}
+
+
+def _header(ts, run_id):
+    return {"ts": ts, "name": "header", "attrs": {"version": "x", "runId": run_id, "sessionId": "s"}}
+
+
+def _write_trace(directory, events):
+    path = Path(directory) / "check.calls.jsonl"
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return path
+
+
 class SessionReportTest(unittest.TestCase):
-    CALLS = [
-        {"model": "m", "prompt_tokens": 25000, "completion_tokens": 900, "cost_cents": 1,
-         "duration_ms": 4000, "finish_reason": "tool_calls", "content_chars": 0,
-         "reasoning_chars": 1200, "tool_calls": ["Read", "Read"]},
-        {"model": "m", "prompt_tokens": 31000, "completion_tokens": 300, "cost_cents": 1,
-         "duration_ms": 9000, "content_chars": 120, "reasoning_chars": 0,
-         "tool_calls": [], "discarded": True},
-        {"model": "m", "prompt_tokens": 31000, "completion_tokens": 32000, "cost_cents": 5,
-         "duration_ms": 41000, "finish_reason": "length", "content_chars": 0,
-         "reasoning_chars": 90000, "tool_calls": []},
+    """The call table reads NextCLI's NEXTCLI_TRACE=basic trace."""
+
+    # A run that read a file, had one attempt discarded, then ran out of output
+    # tokens while thinking.
+    CUT_OFF_RUN = [
+        _header(100, "r1"),
+        _event(101, dur=4000, model="m", usage={
+            "prompt_tokens": 25000, "completion_tokens": 900,
+            "prompt_tokens_details": {"cached_tokens": 1000}},
+            costUsd=0.01, priced="exact", finishReason="tool_calls", ttftMs=800,
+            contentChars=0, reasoningChars=1200, toolCalls=["Read", "Read"]),
+        _event(102, dur=9000, model="m", usage={"prompt_tokens": 31000, "completion_tokens": 300},
+               costUsd=0.01, contentChars=120, reasoningChars=0, toolCalls=[],
+               discarded=True, error="socket hang up"),
+        _event(103, dur=41000, model="m", usage={"prompt_tokens": 31000, "completion_tokens": 32000},
+               costUsd=0.05, finishReason="length", ttftMs=900, contentChars=0,
+               reasoningChars=90000, toolCalls=[]),
     ]
 
     def _read(self, path, size):
@@ -564,13 +585,76 @@ class SessionReportTest(unittest.TestCase):
             "output": [{"content": "x" * size}],
         }
 
-    def test_lists_each_call_and_marks_the_cut_off_one(self):
-        report = checks.session_report(self.CALLS)
+    def _runs(self, events):
+        with tempfile.TemporaryDirectory() as tmp:
+            return checks.read_trace(_write_trace(tmp, events))
+
+    def test_reads_every_field_cn_writes(self):
+        [run] = self._runs(self.CUT_OFF_RUN)
+        self.assertEqual(run["run_id"], "r1")
+        first, discarded, last = run["calls"]
+        self.assertEqual(first["cached_tokens"], 1000)
+        self.assertEqual(first["ttft_ms"], 800)
+        self.assertEqual(first["priced"], "exact")
+        self.assertEqual(first["tool_calls"], ["Read", "Read"])
+        self.assertTrue(discarded["discarded"])
+        self.assertEqual(discarded["error"], "socket hang up")
+        self.assertEqual(last["finish_reason"], "length")
+
+    def test_lists_each_call_and_says_the_run_was_cut_off(self):
+        report = checks.session_report(self._runs(self.CUT_OFF_RUN))
         self.assertIn("2 model calls (1 discarded)", report)
         self.assertIn("87,000 prompt", report)
-        self.assertIn("length", report)
-        self.assertIn("(discarded)", report)
+        self.assertIn("$0.07", report)
+        self.assertIn("discarded, error: socket hang up", report)
+        self.assertIn("cut off at the output cap (32,000 completion tokens)", report)
         self.assertIn("Tool calls: Read x2", report)
+        self.assertNotIn("Run 1", report)
+
+    def test_splits_a_check_and_its_retry_in_time_order(self):
+        retry = [_header(200, "r2"), _event(201, model="m", usage={"prompt_tokens": 5, "completion_tokens": 5},
+                                            costUsd=0.02, finishReason="stop", contentChars=40)]
+        # run-check.sh concatenates the files in name order, which is not time order
+        runs = self._runs(retry + self.CUT_OFF_RUN)
+        self.assertEqual([run["run_id"] for run in runs], ["r1", "r2"])
+        report = checks.session_report(runs)
+        self.assertIn("Run 1: 2 model calls (1 discarded)", report)
+        self.assertIn("Run 2 (retry): 1 model calls (0 discarded)", report)
+        self.assertIn("3 model calls (1 discarded)", report.splitlines()[0])
+
+    def test_tells_an_empty_reply_after_thinking_from_a_truly_empty_one(self):
+        thinking = _event(2, model="m", usage={"prompt_tokens": 9, "completion_tokens": 820,
+                                               "completion_tokens_details": {"reasoning_tokens": 800}},
+                          finishReason="stop", contentChars=0, reasoningChars=0, toolCalls=[])
+        empty = _event(3, model="m", usage={"prompt_tokens": 9, "completion_tokens": 0},
+                       finishReason="stop", contentChars=0, reasoningChars=0, toolCalls=[])
+        [run] = self._runs([_header(1, "r"), thinking])
+        self.assertEqual(run["calls"][0]["reasoning_tokens"], 800)
+        self.assertEqual(
+            checks.run_ending(run["calls"]),
+            "The last call returned no answer and no tool calls after thinking (800 reasoning tokens).",
+        )
+        self.assertIn("0 (800 tok)", checks.session_report([run]))
+        [run] = self._runs([_header(1, "r"), empty])
+        self.assertEqual(
+            checks.run_ending(run["calls"]),
+            "The last call returned nothing: no answer, no tool calls and no reasoning.",
+        )
+
+    def test_reports_a_failed_or_stopped_call(self):
+        failed = _event(2, model="m", error="Bad request", status=400, aborted=False)
+        [run] = self._runs([_header(1, "r"), failed])
+        self.assertEqual(checks.run_ending(run["calls"]), "The last call failed with a provider error 400.")
+        self.assertIn("error 400: Bad request", checks.session_report([run]))
+        stopped = _event(2, model="m", usage={"prompt_tokens": 1, "completion_tokens": 1},
+                         contentChars=3, aborted=True)
+        [run] = self._runs([_header(1, "r"), stopped])
+        self.assertEqual(checks.run_ending(run["calls"]), "The last call was stopped.")
+
+    def test_says_nothing_about_a_run_that_answered(self):
+        answered = _event(2, model="m", finishReason="stop", contentChars=40, toolCalls=[])
+        [run] = self._runs([_header(1, "r"), answered])
+        self.assertIsNone(checks.run_ending(run["calls"]))
 
     def test_reports_tool_result_sizes_and_repeated_reads(self):
         session = {"history": [{"toolCallStates": [
@@ -578,23 +662,68 @@ class SessionReportTest(unittest.TestCase):
             self._read("src/b.ts", 200),
             self._read("src/a.ts", 5000),
         ]}]}
-        report = checks.session_report(self.CALLS, session)
+        report = checks.session_report(self._runs(self.CUT_OFF_RUN), session)
         self.assertIn("Characters returned: Read 10,200", report)
         self.assertIn("Largest results: Read src/a.ts 5,000", report)
         self.assertIn("Repeated: Read src/a.ts x2", report)
 
-    def test_reads_a_call_log_and_skips_bad_lines(self):
+    def test_command_skips_bad_lines_and_a_header_only_trace(self):
         with tempfile.TemporaryDirectory() as tmp:
-            log = Path(tmp) / "x.calls.jsonl"
-            log.write_text(json.dumps(self.CALLS[0]) + "\nnot json\n\n" + json.dumps(self.CALLS[2]) + "\n")
-            calls = checks.read_call_log(log)
-            self.assertEqual([c["finish_reason"] for c in calls], ["tool_calls", "length"])
+            path = Path(tmp) / "check.calls.jsonl"
+            path.write_text(
+                json.dumps(self.CUT_OFF_RUN[0]) + "\nnot json\n[1]\n\n"
+                + json.dumps({"ts": 5, "name": "other"}) + "\n"
+                + json.dumps(self.CUT_OFF_RUN[3]) + "\n"
+            )
             result = subprocess.run(
-                ["python3", "-I", str(MODULE_PATH), "session-report", "--calls", str(log)],
+                ["python3", "-I", str(MODULE_PATH), "session-report", "--calls", str(path)],
                 capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("2 model calls (0 discarded)", result.stdout)
+            self.assertIn("1 model calls (0 discarded)", result.stdout)
+            path.write_text(json.dumps(self.CUT_OFF_RUN[0]) + "\n")
+            result = subprocess.run(
+                ["python3", "-I", str(MODULE_PATH), "session-report", "--calls", str(path)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("0 model calls (0 discarded)", result.stdout)
+
+
+class RetryBudgetTest(unittest.TestCase):
+    def test_leaves_what_the_first_run_did_not_spend(self):
+        summary = {"status": "error", "usage": {"cost": 0.01955}}
+        remaining, spent = checks.retry_budget(summary, 2.0)
+        self.assertAlmostEqual(remaining, 1.98045)
+        self.assertAlmostEqual(spent, 0.01955)
+
+    def test_no_retry_without_a_known_cost(self):
+        self.assertIsNone(checks.retry_budget(None, 2.0))
+        self.assertIsNone(checks.retry_budget({"status": "error"}, 2.0))
+        self.assertIsNone(checks.retry_budget({"status": "error", "usage": {"cost": "x"}}, 2.0))
+
+    def test_no_retry_when_little_is_left(self):
+        self.assertIsNone(checks.retry_budget({"status": "error", "usage": {"cost": 1.9}}, 2.0))
+
+    def test_command_rounds_the_budget_down(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err = Path(tmp) / "check.err"
+            err.write_text('noise\n{"status":"error","message":"x","usage":{"cost":0.00005}}\n')
+            result = subprocess.run(
+                ["python3", "-I", str(MODULE_PATH), "retry-budget", "--stderr", str(err), "--max-cost", "1"],
+                capture_output=True, text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), ["0.9999", "0.000050"])
+
+    def test_annotate_adds_the_earlier_run_to_the_cost(self):
+        annotated = checks.annotate_verdict(
+            {"verdict": "PASS", "summary": "ok", "complete": True, "findings": []},
+            {"status": "done", "usage": {"cost": 0.5, "priced": "exact"}},
+            False,
+            0.25,
+        )
+        self.assertEqual(annotated["usage"]["cost"], 0.75)
 
 
 class RedactTest(unittest.TestCase):
@@ -654,7 +783,10 @@ class AgentExitCodeTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
         for path in Path("/tmp").glob(f"check-{self.NAME}.*"):
-            path.unlink()
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
 
     def run_check(self, exit_code: int, stdout: str = ""):
         agent = self.scripts / "agents" / "nextcli.sh"
@@ -709,6 +841,62 @@ class AgentExitCodeTest(unittest.TestCase):
         result, verdict = self.run_check(2)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(verdict["verdict"], "ERROR")
+
+    def run_twice(self, first_cost: float, timeout: str = "10"):
+        """An agent whose first run errors at `first_cost` and whose second run
+        answers. Returns the result, the verdict and the --max-cost of each run."""
+        answer = json.dumps(
+            {"verdict": "FAIL", "summary": "found one", "complete": True,
+             "findings": [{"file": "a.ts", "title": "Bug", "details": "x"}]}
+        )
+        runs = self.root / "runs"
+        agent = self.scripts / "agents" / "nextcli.sh"
+        agent.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo \"$CHECKS_MAX_COST\" >> '{runs}'\n"
+            f"if [ \"$(wc -l < '{runs}')\" -eq 1 ]; then\n"
+            f"  echo '{{\"status\":\"error\",\"message\":\"The model finished without writing an answer.\",\"usage\":{{\"cost\":{first_cost}}}}}' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            f"printf '%s' '{answer}'\n"
+            "echo '{\"status\":\"done\",\"limit\":null,\"usage\":{\"cost\":0.3}}' >&2\n"
+        )
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "CHECKS_MAX_COST": "2",
+            "CHECKS_TIMEOUT": timeout,
+        }
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
+            env=env, capture_output=True, text=True,
+        )
+        return result, json.loads(self.verdict.read_text()), runs.read_text().split()
+
+    def test_error_is_not_retried_without_time_left(self):
+        # A zero-minute limit leaves nothing for a retry after the first run
+        result, verdict, limits = self.run_twice(0.5, timeout="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "ERROR")
+        self.assertIn("too little", result.stdout)
+
+    def test_error_is_retried_with_the_budget_left(self):
+        result, verdict, limits = self.run_twice(0.5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2", "1.5000"])
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertAlmostEqual(verdict["usage"]["cost"], 0.8)
+
+    def test_error_is_not_retried_when_little_budget_is_left(self):
+        result, verdict, limits = self.run_twice(1.9)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "ERROR")
+        self.assertIn("finished without writing an answer", verdict["summary"])
 
 
 if __name__ == "__main__":

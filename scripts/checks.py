@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import math
 import os
 import re
 import sys
@@ -617,14 +618,24 @@ def _error_detail(run_summary: dict | None) -> str:
     return ""
 
 
-def annotate_verdict(verdict: dict, run_summary: dict | None, limit_exit: bool) -> dict:
+def annotate_verdict(
+    verdict: dict,
+    run_summary: dict | None,
+    limit_exit: bool,
+    spent_before: float = 0.0,
+) -> dict:
     """Adds the agent's usage, says why an ERROR verdict has no result, and
-    marks a run ended by a limit as partial."""
+    marks a run ended by a limit as partial. `spent_before` is what an earlier
+    run of the same check cost, so the reported cost covers both runs."""
     annotated = dict(verdict)
     limit = None
     if run_summary:
         if isinstance(run_summary.get("usage"), dict):
-            annotated["usage"] = run_summary["usage"]
+            usage = dict(run_summary["usage"])
+            cost = usage.get("cost")
+            if spent_before and isinstance(cost, (int, float)):
+                usage["cost"] = round(cost + spent_before, 6)
+            annotated["usage"] = usage
         limit = run_summary.get("limit")
     detail = _error_detail(run_summary)
     if annotated.get("verdict") == "ERROR" and detail:
@@ -814,26 +825,155 @@ def cmd_annotate(args: argparse.Namespace) -> int:
     if args.stderr and Path(args.stderr).is_file():
         stderr_text = Path(args.stderr).read_text(errors="replace")
     annotated = annotate_verdict(
-        verdict, read_run_summary(stderr_text), args.limit_exit
+        verdict, read_run_summary(stderr_text), args.limit_exit, args.spent_before
     )
     path.write_text(json.dumps(annotated))
     return 0
 
 
-def read_call_log(path: Path) -> list[dict]:
-    """The JSON lines NextCLI writes to <session>.calls.jsonl, one per call."""
-    calls = []
+def _dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _number(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _call_from_trace(event: dict) -> dict:
+    """One `llm.request` event of NextCLI's NEXTCLI_TRACE=basic trace.
+
+    The event is {"ts", "dur", "name", "attrs"}. `attrs.usage` is the
+    provider's usage as sent; the other attrs are cn's camelCase call fields.
+    A call that failed before streaming has `error` (and `status`) but no usage.
+    """
+    attrs = _dict(event.get("attrs"))
+    usage = _dict(attrs.get("usage"))
+    prompt_details = _dict(usage.get("prompt_tokens_details"))
+    completion_details = _dict(usage.get("completion_tokens_details"))
+    return {
+        "model": attrs.get("model"),
+        "prompt_tokens": _number(usage.get("prompt_tokens")),
+        "completion_tokens": _number(usage.get("completion_tokens")),
+        "cached_tokens": _number(
+            prompt_details.get("cached_tokens", prompt_details.get("cache_read_tokens"))
+        ),
+        # Providers that hide or encrypt reasoning still count its tokens here
+        "reasoning_tokens": _number(completion_details.get("reasoning_tokens")),
+        "cost_usd": _number(attrs.get("costUsd")),
+        "priced": attrs.get("priced"),
+        "duration_ms": _number(event.get("dur")),
+        "ttft_ms": _number(attrs.get("ttftMs")),
+        "finish_reason": attrs.get("finishReason"),
+        "content_chars": _number(attrs.get("contentChars")),
+        "reasoning_chars": _number(attrs.get("reasoningChars")),
+        "tool_calls": [t for t in attrs.get("toolCalls") or [] if isinstance(t, str)],
+        "discarded": bool(attrs.get("discarded")),
+        "aborted": bool(attrs.get("aborted")),
+        "error": attrs.get("error") if isinstance(attrs.get("error"), str) else None,
+        "status": _number(attrs.get("status")),
+    }
+
+
+def read_trace(path: Path) -> list[dict]:
+    """The runs in a file of NextCLI traces, oldest first.
+
+    Each cn process writes its own file that starts with a `header` event, and
+    run-check.sh concatenates them (a check and its retry), so a header starts
+    a run: {"run_id", "version", "started", "calls": [...]}. Lines that are not
+    JSON objects, and events other than `header` and `llm.request`, are skipped.
+    """
+    runs: list[dict] = []
     for line in path.read_text(errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            record = json.loads(line)
+            event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(record, dict):
-            calls.append(record)
-    return calls
+        if not isinstance(event, dict):
+            continue
+        name = event.get("name")
+        if name == "header":
+            attrs = _dict(event.get("attrs"))
+            runs.append(
+                {
+                    "run_id": attrs.get("runId"),
+                    "version": attrs.get("version"),
+                    "started": _number(event.get("ts")),
+                    "calls": [],
+                }
+            )
+        elif name == "llm.request":
+            if not runs:
+                runs.append({"run_id": None, "version": None, "started": _number(event.get("ts")), "calls": []})
+            runs[-1]["calls"].append(_call_from_trace(event))
+    # The files are concatenated in name order (session id), not in time order
+    runs.sort(key=lambda run: run["started"] if run["started"] is not None else math.inf)
+    return runs
+
+
+def run_ending(calls: list[dict]) -> str | None:
+    """How a run's last model call ended, when that explains a missing answer."""
+    kept = [call for call in calls if not call["discarded"]]
+    if not kept:
+        return None
+    last = kept[-1]
+    if last["error"]:
+        status = f" {last['status']}" if last["status"] is not None else ""
+        return f"The last call failed with a provider error{status}."
+    if last["aborted"]:
+        return "The last call was stopped."
+    if last["finish_reason"] == "length":
+        return f"The last call was cut off at the output cap ({_n(last['completion_tokens'])} completion tokens)."
+    if last["content_chars"] or last["tool_calls"]:
+        return None
+    thought = [
+        f"{_n(value)} reasoning {unit}"
+        for value, unit in ((last["reasoning_chars"], "chars"), (last["reasoning_tokens"], "tokens"))
+        if value
+    ]
+    if thought:
+        return f"The last call returned no answer and no tool calls after thinking ({', '.join(thought)})."
+    return "The last call returned nothing: no answer, no tool calls and no reasoning."
+
+
+# A retry needs at least this share of the cost limit left to be worth running.
+RETRY_MIN_BUDGET_SHARE = 0.1
+
+
+def retry_budget(run_summary: dict | None, max_cost: float) -> tuple[float, float] | None:
+    """(budget left, spent) for a retry of a run with a cost limit, or None when
+    the first run's cost is unknown or too little of the limit is left."""
+    if not run_summary or max_cost <= 0:
+        return None
+    usage = run_summary.get("usage")
+    cost = usage.get("cost") if isinstance(usage, dict) else None
+    if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0:
+        return None
+    remaining = max_cost - cost
+    if remaining < max_cost * RETRY_MIN_BUDGET_SHARE:
+        return None
+    return remaining, float(cost)
+
+
+def cmd_retry_budget(args: argparse.Namespace) -> int:
+    stderr_text = ""
+    if Path(args.stderr).is_file():
+        stderr_text = Path(args.stderr).read_text(errors="replace")
+    try:
+        max_cost = float(args.max_cost)
+    except ValueError:
+        return 1
+    budget = retry_budget(read_run_summary(stderr_text), max_cost)
+    if budget is None:
+        return 1
+    remaining, spent = budget
+    # Round the budget down so the two runs together stay within the limit.
+    print(f"{math.floor(remaining * 10000) / 10000:.4f} {spent:.6f}")
+    return 0
 
 
 def _tool_results(session: dict) -> list[tuple[str, str, int]]:
@@ -866,31 +1006,72 @@ def _n(value: object) -> str:
     return f"{value:,}" if isinstance(value, (int, float)) else "-"
 
 
-def session_report(calls: list[dict], session: dict | None = None) -> str:
-    """A per-call table of one check run, plus what its tools returned."""
-    kept = [call for call in calls if not call.get("discarded")]
-    total = lambda key: sum(c.get(key) or 0 for c in calls)  # noqa: E731
-    lines = [
+def _seconds(ms: object) -> str:
+    return f"{ms / 1000:.1f}" if isinstance(ms, (int, float)) else "-"
+
+
+def _outcome(call: dict) -> str:
+    if call["error"]:
+        status = f" {call['status']}" if call["status"] is not None else ""
+        outcome = f"error{status}: {_fit(call['error'], 80)}"
+        return f"discarded, {outcome}" if call["discarded"] else outcome
+    if call["discarded"]:
+        return "discarded"
+    if call["aborted"]:
+        return "aborted"
+    return ""
+
+
+def _totals(calls: list[dict]) -> str:
+    kept = [call for call in calls if not call["discarded"]]
+    total = lambda key: sum(call[key] or 0 for call in calls)  # noqa: E731
+    return (
         f"{len(kept)} model calls ({len(calls) - len(kept)} discarded), "
         f"{_n(total('prompt_tokens'))} prompt, {_n(total('completion_tokens'))} completion, "
-        f"{_n(total('cached_tokens'))} cached tokens, ${total('cost_cents') / 100:.2f}, "
-        f"{total('duration_ms') / 1000:.0f} s in model calls",
-        "",
-        "  # | prompt     | completion | cached     | seconds | finish     | answer | reasoning | tools",
-    ]
-    for index, call in enumerate(calls, 1):
-        tools = call.get("tool_calls") or []
-        lines.append(
-            f"{index:>3} | {_n(call.get('prompt_tokens')):>10} | {_n(call.get('completion_tokens')):>10} | "
-            f"{_n(call.get('cached_tokens')):>10} | {(call.get('duration_ms') or 0) / 1000:>7.1f} | "
-            f"{str(call.get('finish_reason') or '-'):<10} | {_n(call.get('content_chars')):>6} | "
-            f"{_n(call.get('reasoning_chars')):>9} | "
-            + (", ".join(tools) if tools else "-")
-            + (" (discarded)" if call.get("discarded") else "")
-        )
+        f"{_n(total('cached_tokens'))} cached tokens, ${total('cost_usd'):.2f}, "
+        f"{total('duration_ms') / 1000:.0f} s in model calls"
+    )
+
+
+CALL_TABLE_HEADER = (
+    "  # | prompt     | completion | cached     | seconds | ttft  | finish     "
+    "| answer | reasoning      | tools | outcome"
+)
+
+
+def _call_row(index: int, call: dict) -> str:
+    reasoning = _n(call["reasoning_chars"])
+    if call["reasoning_tokens"]:
+        reasoning += f" ({_n(call['reasoning_tokens'])} tok)"
+    tools = ", ".join(call["tool_calls"]) or "-"
+    return (
+        f"{index:>3} | {_n(call['prompt_tokens']):>10} | {_n(call['completion_tokens']):>10} | "
+        f"{_n(call['cached_tokens']):>10} | {_seconds(call['duration_ms']):>7} | "
+        f"{_seconds(call['ttft_ms']):>5} | {str(call['finish_reason'] or '-'):<10} | "
+        f"{_n(call['content_chars']):>6} | {reasoning:<14} | {tools} | {_outcome(call) or '-'}"
+    )
+
+
+def session_report(runs: list[dict], session: dict | None = None) -> str:
+    """A per-call table for each run of one check, how each run ended, and
+    what the tools of the last run returned."""
+    calls = [call for run in runs for call in run["calls"]]
+    lines = [_totals(calls)]
+    for number, run in enumerate(runs, 1):
+        lines.append("")
+        if len(runs) > 1:
+            retry = " (retry)" if number > 1 else ""
+            lines += [f"Run {number}{retry}: {_totals(run['calls'])}", ""]
+        lines.append(CALL_TABLE_HEADER)
+        lines += [_call_row(index, call) for index, call in enumerate(run["calls"], 1)]
+        ending = run_ending(run["calls"])
+        if ending:
+            lines.append(ending)
     asked: dict[str, int] = {}
-    for call in kept:
-        for tool in call.get("tool_calls") or []:
+    for call in calls:
+        if call["discarded"]:
+            continue
+        for tool in call["tool_calls"]:
             asked[tool] = asked.get(tool, 0) + 1
     if asked:
         lines += ["", "Tool calls: " + ", ".join(f"{t} x{n}" for t, n in sorted(asked.items(), key=lambda kv: -kv[1]))]
@@ -925,7 +1106,7 @@ def cmd_session_report(args: argparse.Namespace) -> int:
             session = loaded if isinstance(loaded, dict) else None
         except json.JSONDecodeError:
             session = None
-    sys.stdout.write(session_report(read_call_log(calls_path), session))
+    sys.stdout.write(session_report(read_trace(calls_path), session))
     return 0
 
 
@@ -1003,11 +1184,20 @@ def build_parser() -> argparse.ArgumentParser:
     annotate.add_argument("--verdict", required=True)
     annotate.add_argument("--stderr")
     annotate.add_argument("--limit-exit", action="store_true")
+    annotate.add_argument("--spent-before", type=float, default=0.0)
     annotate.set_defaults(func=cmd_annotate)
+
+    budget = sub.add_parser(
+        "retry-budget",
+        help="Print the cost budget left for a retry and what the first run spent, or exit 1 if a retry should not run.",
+    )
+    budget.add_argument("--stderr", required=True)
+    budget.add_argument("--max-cost", required=True)
+    budget.set_defaults(func=cmd_retry_budget)
 
     report = sub.add_parser(
         "session-report",
-        help="Print one check run's model calls from NextCLI's call log, and what its tools returned.",
+        help="Print a check's model calls from NextCLI's trace, run by run, and what its tools returned.",
     )
     report.add_argument("--calls", required=True)
     report.add_argument("--session")
