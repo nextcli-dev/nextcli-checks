@@ -215,6 +215,22 @@ runs:
         HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
       run: bash "$GITHUB_ACTION_PATH/scripts/run-checks.sh"
 
+    # The result is also written to the job summary, so a run whose comment job
+    # never starts still shows what the check found.
+    - name: Write the job summary
+      if: always() && inputs.mode == 'run'
+      shell: bash
+      env:
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        CHECKS_MAX_COST: ${{ inputs.max-cost }}
+      run: |
+        dir="$(mktemp -d)"
+        cp /tmp/check-*.verdict.json "$dir"/ 2>/dev/null || true
+        python3 "$GITHUB_ACTION_PATH/scripts/checks.py" render-comment \
+          --dir "$dir" --repo "$GITHUB_REPOSITORY" --sha "$HEAD_SHA" \
+          --max-cost "$CHECKS_MAX_COST" >> "$GITHUB_STEP_SUMMARY" || true
+
     - name: Close unfinished check runs
       if: always() && inputs.mode == 'run'
       shell: bash
