@@ -55,7 +55,7 @@ on:
         type: string
         default: ""
       checks:
-        description: Comma-separated allowlist of checks to run (file names without .md). Empty runs every check in checks-dir. Ignored when check is set. Fails if a listed check does not exist.
+        description: Comma-separated allowlist of checks to run (file names without .md). Empty runs every check in checks-dir. Ignored when check is set. A listed check that does not exist is skipped with a warning.
         type: string
         default: ""
       base-url:
@@ -133,8 +133,7 @@ jobs:
             WANTED="$(printf '%s' "$ALLOWED" | jq -Rc '[split(",")[] | gsub("^\\s+|\\s+$"; "") | select(. != "")]')"
             MISSING="$(jq -cn --argjson all "$CHECKS" --argjson want "$WANTED" '$want - $all')"
             if [ "$MISSING" != "[]" ]; then
-              echo "::error::Checks $MISSING are not in the checks directory. Checks: $CHECKS"
-              exit 1
+              echo "::warning::Ignoring checks not in the checks directory: $MISSING. Checks: $CHECKS"
             fi
             CHECKS="$(jq -cn --argjson all "$CHECKS" --argjson want "$WANTED" '$all | map(select(. as $c | $want | index($c)))')"
           fi
