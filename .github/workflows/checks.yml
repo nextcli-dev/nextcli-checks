@@ -53,13 +53,13 @@ on:
         type: string
         default: ""
       max-turns:
-        description: Model calls one check may make (nextcli only). At the limit the agent reports what it found so far. 0 for no limit.
+        description: Model calls one check may make (nextcli only). At the limit the agent reports what it found so far. Empty allows one call per 20 seconds of the time left, at most 60. 0 for no limit.
         type: string
-        default: "60"
+        default: ""
       install:
-        description: auto installs the dependencies of the projects that hold the changed files, in throwaway containers, so the agent can read libraries. none skips it.
+        description: none (default) or auto. auto installs the dependencies of the projects that hold the changed files, in throwaway containers, so the agent can read libraries. A check's `install:` frontmatter overrides it.
         type: string
-        default: auto
+        default: none
       check:
         description: Run only this check (file name without .md). Empty runs every check in checks-dir.
         type: string

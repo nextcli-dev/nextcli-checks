@@ -48,13 +48,13 @@ inputs:
     required: false
     default: ""
   max-turns:
-    description: Model calls one check may make, for the nextcli agent. At the limit the agent reports what it found so far, and the comment marks the review as partial. 0 for no limit. Other agents ignore it.
+    description: Model calls one check may make, for the nextcli agent. At the limit the agent reports what it found so far, and the comment marks the review as partial. Empty (default) allows one call per 20 seconds of the time left, at most 60, so the turn limit comes before timeout-per-check. 0 for no limit. Other agents ignore it.
     required: false
-    default: "60"
+    default: ""
   install:
-    description: auto (default) installs the dependencies of the projects that hold the changed files, so the agent can read a library inside the repository instead of searching the runner for it. npm, pnpm, and yarn (scripts off), pip (requirements files, wheels only), Go, and Cargo run in a throwaway container. The checkout is read-only and project code does not run. NuGet, Maven, and Gradle are not installed. A failed install is a warning. none skips it.
+    description: none (default) or auto. auto installs the dependencies of the projects that hold the changed files, so the agent can read a library inside the repository instead of searching the runner for it. npm, pnpm, and Yarn 1 (scripts off), pip (requirements files, wheels only), Go, and Cargo run in a throwaway container. The checkout is read-only and project code does not run. NuGet, Maven, Gradle, and Yarn 2+ are not installed. A check can set `install:` in its frontmatter to override this. Nothing is installed for a check that its paths skip. A failed install is a warning.
     required: false
-    default: auto
+    default: none
   results-dir:
     description: In comment mode, the directory that holds the check-*.verdict.json files from the run jobs, usually their downloaded check-results artifacts.
     required: false
@@ -215,8 +215,28 @@ runs:
         CHECKS_MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
       run: bash "$GITHUB_ACTION_PATH/scripts/prepare-diff.sh"
 
+    # Install only when a check this job runs will run its agent and wants
+    # dependencies (its `install:` frontmatter, else the install input).
+    - name: Decide whether to install dependencies
+      id: install
+      if: inputs.mode == 'run' && steps.bot.outputs.skip != 'true'
+      shell: bash
+      env:
+        CHECKS_DIR: ${{ runner.temp }}/nextcli-checks
+        CHECKS_ONLY: ${{ inputs.check }}
+        CHECKS_INSTALL: ${{ inputs.install }}
+      run: |
+        changed=()
+        if [ -f /tmp/changed-files.txt ]; then
+          changed=(--changed /tmp/changed-files.txt)
+        fi
+        wanted="$(python3 "$GITHUB_ACTION_PATH/scripts/checks.py" install-wanted \
+          --dir "$CHECKS_DIR" --only "$CHECKS_ONLY" --default "$CHECKS_INSTALL" ${changed[@]+"${changed[@]}"})"
+        echo "install=${wanted}" >> "$GITHUB_OUTPUT"
+        echo "Dependency install: ${wanted}"
+
     - name: Cache dependency downloads
-      if: inputs.mode == 'run' && steps.bot.outputs.skip != 'true' && inputs.install != 'none'
+      if: inputs.mode == 'run' && steps.install.outputs.install == 'auto'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/checks-deps-cache
@@ -225,12 +245,12 @@ runs:
 
     # Downloads dependencies in throwaway containers. The checkout is read-only,
     # project code does not run, and this step gets no secrets. NuGet, Maven,
-    # and Gradle are not installed.
+    # Gradle, and Yarn 2+ are not installed.
     - name: Install dependencies
-      if: inputs.mode == 'run' && steps.bot.outputs.skip != 'true' && inputs.install != 'none'
+      if: inputs.mode == 'run' && steps.install.outputs.install == 'auto'
       shell: bash
       env:
-        CHECKS_INSTALL: ${{ inputs.install }}
+        CHECKS_INSTALL: auto
         CHECKS_DEPS_CACHE: ${{ runner.temp }}/checks-deps-cache
       run: bash "$GITHUB_ACTION_PATH/scripts/install-deps.sh"
 

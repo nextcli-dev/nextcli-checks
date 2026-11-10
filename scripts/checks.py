@@ -188,14 +188,20 @@ def _ancestors(root: Path, rel_dir: str) -> list[str]:
     return ["/".join(parts[:i]) for i in range(len(parts), -1, -1)]
 
 
+def _plain_file(path: Path) -> bool:
+    """A regular file, not a symlink. The planner reads files from the pull
+    request; a symlink could point at a file on the runner."""
+    return path.is_file() and not path.is_symlink()
+
+
 def _has(root: Path, rel_dir: str, *names: str) -> str | None:
     base = root / rel_dir if rel_dir else root
     for name in names:
         if "*" in name:
-            found = sorted(base.glob(name))
+            found = sorted(path for path in base.glob(name) if _plain_file(path))
             if found:
                 return found[0].name
-        elif (base / name).is_file():
+        elif _plain_file(base / name):
             return name
     return None
 
@@ -209,11 +215,11 @@ def _node_image(root: Path, rel_dir: str) -> str:
     for d in _ancestors(root, rel_dir):
         base = root / d if d else root
         for name in (".nvmrc", ".node-version"):
-            if (base / name).is_file():
+            if _plain_file(base / name):
                 major = _major_version((base / name).read_text())
                 if major:
                     return f"node:{major}"
-        if (base / "package.json").is_file():
+        if _plain_file(base / "package.json"):
             try:
                 engines = json.loads((base / "package.json").read_text()).get("engines") or {}
             except (json.JSONDecodeError, AttributeError):
@@ -226,7 +232,7 @@ def _node_image(root: Path, rel_dir: str) -> str:
 
 def _go_image(root: Path, rel_dir: str) -> str:
     go_mod = (root / rel_dir if rel_dir else root) / "go.mod"
-    match = re.search(r"^go (\d+\.\d+)", go_mod.read_text(), re.M) if go_mod.is_file() else None
+    match = re.search(r"^go (\d+\.\d+)", go_mod.read_text(), re.M) if _plain_file(go_mod) else None
     return f"golang:{match.group(1)}" if match else "golang:1"
 
 
@@ -272,6 +278,7 @@ def _run(
     deps: str,
     prelude: str = "",
     mount_node_modules: bool = False,
+    extra_node_modules: list[str] | None = None,
 ) -> dict:
     return {
         "action": "run",
@@ -283,9 +290,75 @@ def _run(
         "env": env,
         "deps": deps,
         "mount_node_modules": mount_node_modules,
+        "extra_node_modules": extra_node_modules or [],
         "status": "",
         "reason": "",
     }
+
+
+# More workspace packages than this with their own node_modules is too many
+# writable mounts for one install.
+MAX_WORKSPACE_NODE_MODULES = 64
+
+
+def _pnpm_importers(text: str) -> list[str]:
+    """The importer directories in a pnpm-lock.yaml, relative to the lockfile.
+    pnpm writes a node_modules into each of them."""
+    importers: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        if line.startswith("importers:"):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if line and not line.startswith(" "):
+            break
+        match = re.match(r"^  (?! )(['\"]?)([^'\":#]+)\1:\s*(?:\{\})?\s*$", line)
+        if match:
+            importers.append(match.group(2).strip())
+    return [d for d in importers if d not in ("", ".")]
+
+
+def _npm_nested(text: str) -> list[str]:
+    """The directories outside the root node_modules where an npm lockfile
+    places packages: workspace packages with versions that could not be
+    hoisted."""
+    try:
+        packages = json.loads(text).get("packages") or {}
+    except (json.JSONDecodeError, AttributeError):
+        return []
+    found: set[str] = set()
+    for key in packages:
+        if not isinstance(key, str) or key.startswith("node_modules/") or "/node_modules/" not in key:
+            continue
+        found.add(key.split("/node_modules/", 1)[0])
+    return sorted(found)
+
+
+def _workspace_node_modules(root: Path, rel_dir: str, lockfile: str) -> list[str] | None:
+    """Every node_modules outside the project's own that the install writes,
+    relative to the repository root. None when they can't all be mounted."""
+    lock = (root / rel_dir / lockfile) if rel_dir else root / lockfile
+    if not _plain_file(lock):
+        return []
+    text = lock.read_text(errors="replace")
+    if lockfile == "pnpm-lock.yaml":
+        dirs = _pnpm_importers(text)
+    elif lockfile in ("package-lock.json", "npm-shrinkwrap.json"):
+        dirs = _npm_nested(text)
+    else:
+        return []
+    extra: list[str] = []
+    for directory in dirs:
+        path = os.path.normpath(f"{rel_dir}/{directory}" if rel_dir else directory)
+        if not _safe_rel(path) or path == "." or "node_modules" in path.split("/"):
+            return None
+        extra.append(f"{path}/node_modules")
+    extra = sorted(set(extra))
+    if len(extra) > MAX_WORKSPACE_NODE_MODULES:
+        return None
+    return extra
 
 
 def _js_step(root: Path, rel_dir: str, lockfile: str) -> dict:
@@ -303,12 +376,10 @@ def _js_step(root: Path, rel_dir: str, lockfile: str) -> dict:
         )
     elif lockfile == "yarn.lock":
         lock = (root / rel_dir / lockfile) if rel_dir else root / lockfile
-        if "__metadata:" in lock.read_text(errors="replace")[:2000]:
-            manager, argv, prelude = (
-                "yarn",
-                ["yarn", "install", "--immutable", "--mode=skip-build"],
-                "corepack",
-            )
+        if _plain_file(lock) and "__metadata:" in lock.read_text(errors="replace")[:2000]:
+            # Yarn 2+ writes .yarn/ and .pnp.cjs next to the lockfile, which
+            # the read-only checkout does not allow.
+            return _notice("yarn", rel_dir, "skipped", "layout")
         else:
             manager, argv, prelude = (
                 "yarn",
@@ -321,6 +392,9 @@ def _js_step(root: Path, rel_dir: str, lockfile: str) -> dict:
             ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
             "",
         )
+    extra = _workspace_node_modules(root, rel_dir, lockfile)
+    if extra is None:
+        return _notice(manager, rel_dir, "skipped", "layout")
     deps = f"{rel_dir}/node_modules" if rel_dir else "node_modules"
     return _run(
         manager,
@@ -331,6 +405,7 @@ def _js_step(root: Path, rel_dir: str, lockfile: str) -> dict:
         deps,
         prelude=prelude,
         mount_node_modules=True,
+        extra_node_modules=extra,
     )
 
 
@@ -348,7 +423,7 @@ def _python_dir(root: Path, rel_dir: str) -> str | None:
             return d
         base = root / d if d else root
         if any(
-            path.is_file() and _SAFE_REQUIREMENTS.fullmatch(path.name)
+            _plain_file(path) and _SAFE_REQUIREMENTS.fullmatch(path.name)
             for path in base.glob("requirements*.txt")
         ):
             return d
@@ -360,7 +435,7 @@ def _requirements_name(root: Path, rel_dir: str) -> str | None:
     names = sorted(
         path.name
         for path in base.glob("requirements*.txt")
-        if path.is_file() and _SAFE_REQUIREMENTS.fullmatch(path.name)
+        if _plain_file(path) and _SAFE_REQUIREMENTS.fullmatch(path.name)
     )
     if "requirements.txt" in names:
         return "requirements.txt"
@@ -1001,7 +1076,12 @@ def render_comment(
     return _fit(body, GITHUB_TEXT_LIMIT)
 
 
-def check_run_body(verdict: dict, conclusion: str, details_url: str, repo: str = "", sha: str = "") -> dict:
+def check_run_body(
+    verdict: dict, conclusion: str, details_url: str, repo: str = "", sha: str = "", name: str = ""
+) -> dict:
+    """The body that completes a check run. With a name, it creates the run
+    already completed, so there is no update right after the create (GitHub
+    can answer 404 for a few seconds after a run is created)."""
     summary = str(verdict.get("summary") or "No summary given")
     text_parts = [summary]
     note = partial_note(verdict)
@@ -1023,6 +1103,9 @@ def check_run_body(verdict: dict, conclusion: str, details_url: str, repo: str =
     }
     if details_url:
         body["details_url"] = details_url
+    if name:
+        body["name"] = name
+        body["head_sha"] = sha
     return body
 
 
@@ -1151,6 +1234,36 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+INSTALL_MODES = ("auto", "none")
+
+
+def check_install(frontmatter: dict, default: str) -> str:
+    """A check's `install:` (auto or none), or the action's input when the
+    check does not set it or sets something else."""
+    value = frontmatter.get("install")
+    if isinstance(value, str) and value.strip().lower() in INSTALL_MODES:
+        return value.strip().lower()
+    return default
+
+
+def cmd_install_wanted(args: argparse.Namespace) -> int:
+    """Prints auto when a check this job runs will run its agent and wants
+    dependencies, else none. A check skipped by its paths installs nothing."""
+    default = args.default if args.default in INSTALL_MODES else "none"
+    directory = Path(args.dir)
+    changed = load_changed_files(args.changed)
+    paths = iter_checks(directory) if directory.is_dir() else []
+    if args.only:
+        paths = [path for path in paths if path.stem == args.only]
+    for path in paths:
+        frontmatter, _body = parse_frontmatter(path.read_text())
+        if check_applies(frontmatter, changed) and check_install(frontmatter, default) == "auto":
+            sys.stdout.write("auto\n")
+            return 0
+    sys.stdout.write("none\n")
+    return 0
+
+
 def cmd_frontmatter(args: argparse.Namespace) -> int:
     text = Path(args.check).read_text()
     frontmatter, _body = parse_frontmatter(text)
@@ -1159,6 +1272,9 @@ def cmd_frontmatter(args: argparse.Namespace) -> int:
     title = str(frontmatter.get("name") or Path(args.check).stem)
     sys.stdout.write(f"fm_skip={0 if applies else 1}\n")
     sys.stdout.write(f"fm_title={shell_quote(title)}\n")
+    install = check_install(frontmatter, "")
+    if install:
+        sys.stdout.write(f"fm_install={install}\n")
     model_value = frontmatter.get("model")
     if isinstance(model_value, str) and model_value:
         provider, model = split_model(model_value, args.provider or "")
@@ -1287,6 +1403,7 @@ def cmd_check_run_body(args: argparse.Namespace) -> int:
             args.details_url or "",
             repo=args.repo or "",
             sha=args.sha or "",
+            name=args.name or "",
         ),
         sys.stdout,
     )
@@ -1631,6 +1748,13 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd.add_argument("--lines", action="store_true")
     list_cmd.set_defaults(func=cmd_list)
 
+    wanted = sub.add_parser("install-wanted")
+    wanted.add_argument("--dir", required=True)
+    wanted.add_argument("--only", default="")
+    wanted.add_argument("--changed")
+    wanted.add_argument("--default", default="none")
+    wanted.set_defaults(func=cmd_install_wanted)
+
     front = sub.add_parser("frontmatter")
     front.add_argument("--check", required=True)
     front.add_argument("--changed")
@@ -1682,6 +1806,7 @@ def build_parser() -> argparse.ArgumentParser:
     check_run.add_argument("--verdict")
     check_run.add_argument("--repo", default="")
     check_run.add_argument("--sha", default="")
+    check_run.add_argument("--name", default="", help="Create the run, completed, under this name.")
     check_run.set_defaults(func=cmd_check_run_body)
 
     comment = sub.add_parser(

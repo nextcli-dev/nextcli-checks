@@ -856,6 +856,68 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "INCOMPLETE")
         self.assertIn("did not review the diff", verdict["summary"])
 
+    def test_a_check_skipped_by_its_paths_creates_its_run_once(self):
+        # Run 42841730927: migration-safety was skipped by its paths, and the
+        # update right after the create answered 404.
+        self.check.write_text("---\nname: M\npaths:\n  - \"**/*.sql\"\n---\nM.\n")
+        changed = Path("/tmp/changed-files.txt")
+        changed.write_text("src/a.ts\n")
+        self.addCleanup(changed.unlink, missing_ok=True)
+        calls = self.root / "gh-calls"
+        gh = self.bin / "gh"
+        gh.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> '{calls}'\necho 7\n")
+        gh.chmod(0o755)
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "GITHUB_REPOSITORY": "nextcli-dev/nextcli-checks",
+            "HEAD_SHA": "f4a953d",
+        }
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (call,) = calls.read_text().splitlines()
+        self.assertNotIn("PATCH", call)
+        self.assertNotIn("in_progress", call)
+        self.assertEqual(json.loads(self.verdict.read_text())["verdict"], "SKIP")
+
+    def turns_given(self, timeout: str, max_turns: str | None) -> str:
+        record = self.root / "turns"
+        agent = self.scripts / "agents" / "nextcli.sh"
+        agent.write_text(f"#!/usr/bin/env bash\necho \"$CHECKS_MAX_TURNS\" > '{record}'\nprintf '%s' '{self.VALID}'\n")
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "CHECKS_TIMEOUT": timeout,
+        }
+        if max_turns is not None:
+            env["CHECKS_MAX_TURNS"] = max_turns
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return record.read_text().strip()
+
+    def test_without_max_turns_the_limit_follows_the_time_left(self):
+        # One call per 20 seconds: the turn limit comes before the timeout.
+        # A second or two of setup comes off the time left.
+        self.assertIn(int(self.turns_given("10", None)), range(28, 31))
+        self.assertIn(int(self.turns_given("10", "")), range(28, 31))
+        self.assertEqual(self.turns_given("25", None), "60")
+
+    def test_an_explicit_max_turns_is_kept(self):
+        self.assertEqual(self.turns_given("10", "45"), "45")
+        self.assertEqual(self.turns_given("10", "0"), "0")
+
     def run_sequence(self, runs, timeout="10", max_cost="2"):
         """An agent that behaves like runs[i] on its i-th run: (exit code,
         stdout, last stderr line). Returns the result, the verdict, and the
@@ -1162,8 +1224,44 @@ class DepsPlanTest(unittest.TestCase):
         self.assertEqual(commands["y"]["prelude"], "corepack-yarn1")
         self.assertIn("--ignore-scripts", commands["y"]["argv"])
         self.assertNotIn("corepack prepare", commands["y"]["argv"])
-        self.assertEqual(commands["z"]["prelude"], "corepack")
-        self.assertIn("--mode=skip-build", commands["z"]["argv"])
+        # Yarn 2+ writes .yarn/ and .pnp.cjs beside the lockfile; the checkout is read-only.
+        self.assertEqual((commands["z"]["action"], commands["z"]["reason"]), ("skip", "layout"))
+
+    def test_pnpm_workspace_packages_get_their_own_node_modules(self):
+        self.write("pnpm-workspace.yaml", "packages:\n  - 'pkgs/*'\n")
+        self.write(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  pkgs/x:\n    dependencies:\n"
+            "      ms:\n        specifier: 2.1.3\n        version: 2.1.3\n\n  'pkgs/y': {}\n\npackages:\n\n  ms@2.1.3: {}\n",
+        )
+        (step,) = checks.deps_plan(self.root, ["pkgs/x/a.ts"])
+        self.assertEqual(step["action"], "run")
+        self.assertEqual(step["dir"], "")
+        self.assertEqual(step["extra_node_modules"], ["pkgs/x/node_modules", "pkgs/y/node_modules"])
+
+    def test_npm_packages_that_could_not_be_hoisted_get_their_node_modules(self):
+        self.write("app/package-lock.json", json.dumps({"packages": {
+            "": {}, "node_modules/ms": {}, "node_modules/a/node_modules/b": {},
+            "ws/one/node_modules/ms": {}, "../linked": {},
+        }}))
+        (step,) = checks.deps_plan(self.root, ["app/ws/one/x.ts"])
+        self.assertEqual(step["dir"], "app")
+        self.assertEqual(step["extra_node_modules"], ["app/ws/one/node_modules"])
+
+    def test_a_workspace_outside_the_project_is_not_installed(self):
+        self.write("p/pnpm-lock.yaml", "importers:\n\n  .: {}\n\n  ../../escape: {}\n")
+        (step,) = checks.deps_plan(self.root, ["p/a.ts"])
+        self.assertEqual((step["action"], step["reason"]), ("skip", "layout"))
+
+    def test_symlinked_planning_files_are_not_read(self):
+        outside = self.root.parent / f"{self.root.name}-outside"
+        outside.mkdir()
+        self.addCleanup(shutil.rmtree, outside)
+        (outside / "nvmrc").write_text("18\n")
+        self.write("a/package-lock.json", "{}")
+        (self.root / "a" / ".nvmrc").symlink_to(outside / "nvmrc")
+        (step,) = checks.deps_plan(self.root, ["a/x.ts"])
+        self.assertEqual(step["image"], "node:22")
 
     def test_dependencies_and_the_base_checkout_are_not_projects(self):
         self.write("package-lock.json", "{}")
@@ -1203,6 +1301,50 @@ class DepsPlanTest(unittest.TestCase):
         self.assertLess(text.index("## PR Diff"), text.index("## Check"))
         self.assertIn("+ @@CHECK_BODY@@ in a diff", text)
         self.assertEqual(text.count("CHECK BODY"), 1)
+
+
+class InstallWantedTest(unittest.TestCase):
+    """Dependencies are installed only for a check that runs its agent and wants them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        (self.dir / "review.md").write_text("---\nname: Review\n---\nReview.\n")
+        (self.dir / "migrations.md").write_text("---\nname: M\npaths:\n  - \"**/*.sql\"\ninstall: auto\n---\nM.\n")
+        (self.dir / "style.md").write_text("---\nname: Style\ninstall: none\n---\nS.\n")
+        self.changed = self.dir / "changed.txt"
+        self.changed.write_text("src/a.ts\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def wanted(self, default: str, only: str = "") -> str:
+        result = subprocess.run(
+            ["python3", str(Path(__file__).parent / "checks.py"), "install-wanted",
+             "--dir", str(self.dir), "--only", only, "--changed", str(self.changed), "--default", default],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_the_input_applies_to_a_check_that_does_not_say(self):
+        self.assertEqual(self.wanted("auto", "review"), "auto")
+        self.assertEqual(self.wanted("none", "review"), "none")
+
+    def test_a_check_skipped_by_its_paths_installs_nothing(self):
+        self.assertEqual(self.wanted("auto", "migrations"), "none")
+        self.changed.write_text("db/1.sql\n")
+        self.assertEqual(self.wanted("none", "migrations"), "auto")
+
+    def test_a_check_can_turn_it_off(self):
+        self.assertEqual(self.wanted("auto", "style"), "none")
+
+    def test_any_check_of_the_job_that_wants_it(self):
+        self.assertEqual(self.wanted("auto"), "auto")
+        self.assertEqual(self.wanted("none"), "none")
+
+    def test_an_unknown_value_is_none(self):
+        self.assertEqual(self.wanted("yes", "review"), "none")
 
 
 class InstallDepsTest(unittest.TestCase):
@@ -1301,6 +1443,49 @@ class InstallDepsTest(unittest.TestCase):
         self.assertNotIn("a.ts", script)
         self.assertNotIn("yarn.lock", script)
         self.assertNotIn("pkg", script)
+
+    def test_symlinked_node_modules_is_not_mounted_or_written(self):
+        victim = Path(self.tmp.name) / "checks"
+        victim.mkdir()
+        (victim / "review.md").write_text("keep")
+        (self.workspace / "pkg" / "node_modules").symlink_to(victim)
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in calls if c.startswith("run ")], [])
+        self.assertIn("::warning::Skipping npm in pkg", result.stdout)
+        self.assertEqual(self.results.read_text(), "npm\tpkg/node_modules\tskipped\tunsafe-path\n")
+        self.assertEqual(sorted(p.name for p in victim.iterdir()), ["review.md"])
+
+    def test_symlinked_deps_dir_is_not_written_through(self):
+        victim = Path(self.tmp.name) / "elsewhere"
+        victim.mkdir()
+        (self.workspace / ".checks-deps").symlink_to(victim)
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in calls if c.startswith("run ")], [])
+        self.assertEqual(list(victim.iterdir()), [])
+        self.assertIn("unsafe-path", self.results.read_text())
+
+    def test_a_symlinked_parent_of_node_modules_is_refused(self):
+        real = Path(self.tmp.name) / "real-pkg"
+        (self.workspace / "pkg").rename(real)
+        (self.workspace / "pkg").symlink_to(real)
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in calls if c.startswith("run ")], [])
+        self.assertFalse((real / "node_modules").exists())
+
+    def test_workspace_packages_are_mounted_writable(self):
+        (self.workspace / "pkg" / "package-lock.json").unlink()
+        (self.workspace / "pkg" / "pnpm-lock.yaml").write_text("importers:\n\n  .: {}\n\n  libs/one: {}\n")
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (run,) = [c for c in calls if c.startswith("run ")]
+        self.assertIn(f"-v {self.workspace}:/work:ro", run)
+        self.assertIn(f"-v {self.workspace}/pkg/node_modules:/work/pkg/node_modules", run)
+        self.assertIn(f"-v {self.workspace}/pkg/libs/one/node_modules:/work/pkg/libs/one/node_modules", run)
+        self.assertTrue((self.workspace / "pkg" / "libs" / "one" / "node_modules").is_dir())
+        self.assertEqual(self.results.read_text(), "pnpm\tpkg/node_modules\tok\t\n")
 
     def test_install_none_runs_nothing(self):
         result, calls = self.run_install(mode="none")
@@ -1403,6 +1588,53 @@ class ReportRetryTest(unittest.TestCase):
         self.assertEqual(len(self.calls.read_text().splitlines()), 3)
         self.assertIn("retrying", result.stderr)
         self.assertIn("129918725399", self.done.read_text())
+
+    def test_a_server_error_is_retried(self):
+        self.write_gh(
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            f"n=$(wc -l < '{self.calls}' | tr -d ' ')\n"
+            "if [ \"$n\" -lt 2 ]; then echo 'gh: Server Error (HTTP 502)' >&2; exit 1; fi\n"
+            "exit 0\n"
+        )
+        result = self.run_report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 2)
+
+    def test_without_a_run_id_the_run_is_created_completed_in_one_call(self):
+        body = Path(self.tmp.name) / "body.json"
+        self.write_gh(
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            'while [ $# -gt 0 ]; do [ "$1" = --input ] && cp "$2" ' + f"'{body}'" + '; shift; done\n'
+        )
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "GITHUB_REPOSITORY": "nextcli-dev/nextcli-checks",
+            "HEAD_SHA": "f4a953d",
+            "CHECKS_GH_RETRY_DELAY": "0",
+            "HOME": str(self.tmp.name),
+        }
+        result = subprocess.run(
+            ["bash", str(Path(__file__).parent / "report.sh"), "migration-safety", str(self.verdict), ""],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (call,) = self.calls.read_text().splitlines()
+        self.assertNotIn("PATCH", call)
+        self.assertIn("repos/nextcli-dev/nextcli-checks/check-runs", call)
+        sent = json.loads(body.read_text())
+        self.assertEqual(sent["name"], "check/migration-safety")
+        self.assertEqual(sent["head_sha"], "f4a953d")
+        self.assertEqual((sent["status"], sent["conclusion"]), ("completed", "success"))
+
+    def test_without_a_run_id_or_a_commit_nothing_is_sent(self):
+        self.write_gh(f"printf '%s\\n' \"$*\" >> '{self.calls}'\n")
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "HOME": str(self.tmp.name)}
+        result = subprocess.run(
+            ["bash", str(Path(__file__).parent / "report.sh"), "migration-safety", str(self.verdict), ""],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls.exists())
 
     def test_a_non_404_is_not_retried(self):
         self.write_gh(

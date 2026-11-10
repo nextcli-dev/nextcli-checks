@@ -9,6 +9,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=retry-gh.sh
+source "$script_dir/retry-gh.sh"
 check_file="${1:?check file is required}"
 
 if [ ! -f "$check_file" ]; then
@@ -41,17 +43,9 @@ trace_dir="/tmp/check-${name}.traces"
 rm -rf "$trace_dir"
 mkdir -p "$trace_dir"
 
+# A check that ends before its agent runs (below) has no check run yet;
+# report.sh creates it already completed.
 check_run_id=""
-if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
-  check_run_id="$(gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
-    -f "name=check/${name}" \
-    -f "head_sha=${HEAD_SHA}" \
-    -f status=in_progress \
-    --jq '.id')"
-  # close-check-runs.sh completes any run left in progress by a cancelled or
-  # timed-out job.
-  echo "$check_run_id" >> /tmp/check-runs-started.txt
-fi
 
 # Writes a verdict that isn't the agent's own: ERROR, SKIP or INCOMPLETE.
 write_verdict() {
@@ -76,6 +70,17 @@ if [ -z "$provider" ] || [ -z "$model" ]; then
   exit 0
 fi
 
+# The agent will run: show the check as in progress. close-check-runs.sh
+# completes this run if the job is cancelled or times out.
+if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+  check_run_id="$(retry_gh gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
+    -f "name=check/${name}" \
+    -f "head_sha=${HEAD_SHA}" \
+    -f status=in_progress \
+    --jq '.id')"
+  echo "$check_run_id" >> /tmp/check-runs-started.txt
+fi
+
 # The first run and its retry share one time limit.
 deadline=$((SECONDS + timeout_minutes * 60))
 
@@ -95,6 +100,11 @@ time_for_retry() {
   return 1
 }
 
+# A model call takes about 15 seconds (82 calls in 21 minutes in nextcli run
+# 42693558895). 20 leaves room for tool calls and the final answer.
+SECONDS_PER_TURN=20
+MAX_DERIVED_TURNS=60
+
 run_agent() {
   local seconds_left=$((deadline - SECONDS))
   if [ "$seconds_left" -lt 1 ]; then
@@ -111,13 +121,25 @@ run_agent() {
     render_args+=(--deps /tmp/checks-deps.txt)
   fi
   "${render_args[@]}" > "$prompt"
+  # Without an explicit max-turns, allow one model call per SECONDS_PER_TURN of
+  # the time left, at most MAX_DERIVED_TURNS, so the agent reaches its turn
+  # limit, and still answers, before the timeout kills it with no answer.
+  local max_turns="${CHECKS_MAX_TURNS:-}"
+  if [ -z "$max_turns" ]; then
+    max_turns=$((seconds_left / SECONDS_PER_TURN))
+    if [ "$max_turns" -gt "$MAX_DERIVED_TURNS" ]; then
+      max_turns=$MAX_DERIVED_TURNS
+    elif [ "$max_turns" -lt 1 ]; then
+      max_turns=1
+    fi
+  fi
   # The caller turns errexit off around this call. Don't touch it here: turning
   # it back on before the return below would exit the whole script on any
   # non-zero agent status (124 timeout, 3 limit, 2 bad configuration), before
   # a verdict is written.
   # The agent gets the provider key and nothing else secret: no GitHub token
   # and no Actions runtime tokens.
-  CHECKS_PROVIDER="$provider" CHECKS_MODEL="$model" CHECKS_TRACE_DIR="$trace_dir" \
+  CHECKS_PROVIDER="$provider" CHECKS_MODEL="$model" CHECKS_TRACE_DIR="$trace_dir" CHECKS_MAX_TURNS="$max_turns" \
     timeout "${seconds_left}s" \
     env -u GH_TOKEN -u GITHUB_TOKEN \
       -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL -u ACTIONS_RESULTS_URL -u ACTIONS_CACHE_URL \

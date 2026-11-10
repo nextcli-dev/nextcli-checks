@@ -9,7 +9,10 @@
 # file with wheels only, go mod download, and cargo fetch --locked. NuGet,
 # Maven, and Gradle are not installed. The checkout is mounted read-only.
 # Writable mounts are .checks-deps and, for JavaScript, the project's
-# node_modules. No secrets, no runner files, no Docker socket.
+# node_modules and those of its workspace packages. Each must be a plain
+# directory of the checkout or not exist yet: a symlink committed in the pull
+# request would otherwise make the mount, and the install, write outside it.
+# No secrets, no runner files, no Docker socket.
 #
 # Writes /tmp/checks-deps.txt: ecosystem, location, status, reason per line,
 # which run-check.sh turns into the prompt's Dependencies section.
@@ -69,17 +72,42 @@ unsafe_dir() {
   return 1
 }
 
-prepared=false
-prepare_workspace() {
-  if [ "$prepared" = true ]; then
-    return
+# A directory the install writes to, relative to the workspace, is unsafe when
+# any part of the path is a symlink or not a directory, or when the pull
+# request's tree has files in it. The path itself was checked by unsafe_dir.
+unsafe_write_dir() {
+  local rel="$1" path="$workspace" part
+  local IFS=/
+  for part in $rel; do
+    path="$path/$part"
+    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+      return 0
+    fi
+  done
+  if [ -n "$(git -C "$workspace" ls-files -- "$rel" 2>/dev/null | head -n 1)" ]; then
+    return 0
   fi
-  mkdir -p "$workspace/.checks-deps" "$cache"
-  # Search (rg) skips ignored files, so installed packages don't flood results.
-  printf '*\n' > "$workspace/.checks-deps/.gitignore"
-  prepared=true
+  return 1
 }
 
+prepared=""
+prepare_workspace() {
+  if [ -n "$prepared" ]; then
+    [ "$prepared" = ok ]
+    return
+  fi
+  if unsafe_write_dir "$DEPS_DIR"; then
+    echo "::warning::${DEPS_DIR} in the pull request is not a plain directory. Dependencies are not installed."
+    prepared=unsafe
+    return 1
+  fi
+  mkdir -p "$workspace/$DEPS_DIR" "$cache"
+  # Search (rg) skips ignored files, so installed packages don't flood results.
+  printf '*\n' > "$workspace/$DEPS_DIR/.gitignore"
+  prepared=ok
+}
+
+DEPS_DIR=.checks-deps
 docker_ok=true
 if ! command -v "$docker" >/dev/null 2>&1; then
   docker_ok=false
@@ -108,6 +136,8 @@ while IFS= read -r line || [ -n "$line" ]; do
       summary_lines+=("| ${ecosystem} | \`${project}\` | skipped, past the project cap |")
     elif [ "$reason" = "no-time" ]; then
       summary_lines+=("| ${ecosystem} | \`${project}\` | skipped, no time left |")
+    elif [ "$reason" = "layout" ]; then
+      summary_lines+=("| ${ecosystem} | \`${project}\` | skipped, the install would write outside node_modules |")
     else
       summary_lines+=("| ${ecosystem} | — | skipped (${reason}) |")
     fi
@@ -169,24 +199,42 @@ while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$pair" ] && env_args+=(-e "$pair")
   done < <(python3 -c 'import json,sys; data=json.loads(sys.argv[1]); items=[f"{key}={value}".encode() for key, value in (data.get("env") or {}).items()]; sys.stdout.buffer.write(b"\0".join(items) + (b"\0" if items else b""))' "$line")
 
-  prepare_workspace
+  # Every directory the container may write, relative to the workspace.
+  writable=()
+  if [ "$mount_nm" = "true" ]; then
+    if [ -n "$dir" ]; then
+      writable+=("$dir/node_modules")
+    else
+      writable+=("node_modules")
+    fi
+    while IFS= read -r -d '' extra; do
+      [ -n "$extra" ] && writable+=("$extra")
+    done < <(python3 -c 'import json,sys; data=json.loads(sys.argv[1]); items=[item.encode() for item in data.get("extra_node_modules") or []]; sys.stdout.buffer.write(b"\0".join(items) + (b"\0" if items else b""))' "$line")
+  fi
+  unsafe=false
+  for rel in ${writable[@]+"${writable[@]}"}; do
+    if unsafe_dir "$rel" || unsafe_write_dir "$rel"; then
+      unsafe=true
+      break
+    fi
+  done
+  if [ "$unsafe" = true ] || ! prepare_workspace; then
+    echo "::warning::Skipping ${ecosystem} in ${project}: a directory it writes to is a symlink, a file, or part of the pull request."
+    record "$ecosystem" "$deps" skipped unsafe-path
+    summary_lines+=("| ${ecosystem} | \`${project}\` | skipped (unsafe-path) |")
+    continue
+  fi
+
   if [ -n "$dir" ]; then
     workdir="/work/${dir}"
   else
     workdir="/work"
   fi
-  mounts=(-v "$workspace:/work:ro" -v "$cache:/cache" -v "$workspace/.checks-deps:/work/.checks-deps")
-  if [ "$mount_nm" = "true" ]; then
-    if [ -n "$dir" ]; then
-      host_nm="$workspace/$dir/node_modules"
-      work_nm="/work/$dir/node_modules"
-    else
-      host_nm="$workspace/node_modules"
-      work_nm="/work/node_modules"
-    fi
-    mkdir -p "$host_nm"
-    mounts+=(-v "$host_nm:$work_nm")
-  fi
+  mounts=(-v "$workspace:/work:ro" -v "$cache:/cache" -v "$workspace/$DEPS_DIR:/work/$DEPS_DIR")
+  for rel in ${writable[@]+"${writable[@]}"}; do
+    mkdir -p "$workspace/$rel"
+    mounts+=(-v "$workspace/$rel:/work/$rel")
+  done
 
   container="checks-deps-$$-${RANDOM}"
   started=$SECONDS
