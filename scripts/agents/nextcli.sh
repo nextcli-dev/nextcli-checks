@@ -45,6 +45,10 @@ args=(-p --format json --readonly --config "$config")
 if [ -n "${CHECKS_MAX_COST:-}" ]; then
   args+=(--max-cost "$CHECKS_MAX_COST")
 fi
+# At --max-turns the agent also gives a final answer and exits 3. 0 is off.
+if [ -n "${CHECKS_MAX_TURNS:-}" ] && [ "$CHECKS_MAX_TURNS" != "0" ]; then
+  args+=(--max-turns "$CHECKS_MAX_TURNS")
+fi
 
 # Not exec: the trap must remove the config file when cn exits.
 set +e

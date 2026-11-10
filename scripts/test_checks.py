@@ -294,6 +294,8 @@ class ConfigTest(unittest.TestCase):
 
     def test_conclusion(self):
         self.assertEqual(checks.conclusion_for("PASS", "neutral"), "success")
+        self.assertEqual(checks.conclusion_for("PASS", "neutral", complete=False), "neutral")
+        self.assertEqual(checks.conclusion_for("FAIL", "neutral", complete=False), "failure")
         self.assertEqual(checks.conclusion_for("SKIP", "failure"), "success")
         self.assertEqual(checks.conclusion_for("FAIL", "neutral"), "failure")
         self.assertEqual(checks.conclusion_for("ERROR", "neutral"), "neutral")
@@ -845,12 +847,178 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "FAIL")
         self.assertFalse(verdict["complete"])
         self.assertEqual(len(verdict["findings"]), 1)
+        self.assertEqual(checks.conclusion_for(verdict["verdict"], "neutral", verdict["complete"]), "failure")
 
     def test_unfinished_verdict_with_no_findings_is_not_a_review(self):
-        result, verdict = self.run_check(3, self.VALID)
+        # A run that finished on its own (exit 0) and looked at nothing.
+        result, verdict = self.run_check(0, self.VALID)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(verdict["verdict"], "INCOMPLETE")
         self.assertIn("did not review the diff", verdict["summary"])
+
+    def test_a_check_skipped_by_its_paths_creates_its_run_once(self):
+        # Run 42841730927: migration-safety was skipped by its paths, and the
+        # update right after the create answered 404.
+        self.check.write_text("---\nname: M\npaths:\n  - \"**/*.sql\"\n---\nM.\n")
+        changed = Path("/tmp/changed-files.txt")
+        changed.write_text("src/a.ts\n")
+        self.addCleanup(changed.unlink, missing_ok=True)
+        calls = self.root / "gh-calls"
+        gh = self.bin / "gh"
+        gh.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> '{calls}'\necho 7\n")
+        gh.chmod(0o755)
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "GITHUB_REPOSITORY": "nextcli-dev/nextcli-checks",
+            "HEAD_SHA": "f4a953d",
+        }
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (call,) = calls.read_text().splitlines()
+        self.assertNotIn("PATCH", call)
+        self.assertNotIn("in_progress", call)
+        self.assertEqual(json.loads(self.verdict.read_text())["verdict"], "SKIP")
+
+    def turns_given(self, timeout: str, max_turns: str | None) -> str:
+        record = self.root / "turns"
+        agent = self.scripts / "agents" / "nextcli.sh"
+        agent.write_text(f"#!/usr/bin/env bash\necho \"$CHECKS_MAX_TURNS\" > '{record}'\nprintf '%s' '{self.VALID}'\n")
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "CHECKS_TIMEOUT": timeout,
+        }
+        if max_turns is not None:
+            env["CHECKS_MAX_TURNS"] = max_turns
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return record.read_text().strip()
+
+    def test_without_max_turns_the_limit_follows_the_time_left(self):
+        # One call per 20 seconds: the turn limit comes before the timeout.
+        # A second or two of setup comes off the time left.
+        self.assertIn(int(self.turns_given("10", None)), range(28, 31))
+        self.assertIn(int(self.turns_given("10", "")), range(28, 31))
+        self.assertEqual(self.turns_given("25", None), "60")
+
+    def test_an_explicit_max_turns_is_kept(self):
+        self.assertEqual(self.turns_given("10", "45"), "45")
+        self.assertEqual(self.turns_given("10", "0"), "0")
+
+    def run_sequence(self, runs, timeout="10", max_cost="2"):
+        """An agent that behaves like runs[i] on its i-th run: (exit code,
+        stdout, last stderr line). Returns the result, the verdict, and the
+        --max-cost each run got."""
+        record = self.root / "runs"
+        agent = self.scripts / "agents" / "nextcli.sh"
+        lines = ["#!/usr/bin/env bash", f"echo \"$CHECKS_MAX_COST\" >> '{record}'", f"n=$(wc -l < '{record}' | tr -d ' ')"]
+        for index, (code, stdout, stderr) in enumerate(runs, start=1):
+            lines += [
+                f"if [ \"$n\" -eq {index} ]; then",
+                f"  printf '%s' '{stdout}'",
+                f"  echo '{stderr}' >&2",
+                f"  exit {code}",
+                "fi",
+            ]
+        lines.append("exit 1")
+        agent.write_text("\n".join(lines) + "\n")
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "CHECKS_MAX_COST": max_cost,
+            "CHECKS_TIMEOUT": timeout,
+        }
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
+            env=env, capture_output=True, text=True,
+        )
+        return result, json.loads(self.verdict.read_text()), record.read_text().split()
+
+    def test_limit_exit_with_no_findings_is_kept_as_a_partial_review(self):
+        # Run 42693558895: a review that stopped at its cost cap after 82
+        # calls answered PASS with no findings. It was retried as "reviewed
+        # nothing", and the retry ran out of time.
+        answer = json.dumps(
+            {"verdict": "pass", "summary": "checked most files", "complete": False, "findings": []}
+        )
+        summary = '{"status":"limit","limit":"cost","usage":{"cost":1.84}}'
+        result, verdict, limits = self.run_sequence([(3, answer, summary)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "PASS")
+        self.assertFalse(verdict["complete"])
+        self.assertEqual(verdict["limit"], "cost")
+        self.assertEqual(checks.conclusion_for(verdict["verdict"], "neutral", verdict["complete"]), "neutral")
+
+    def test_empty_review_is_retried_with_the_budget_left(self):
+        empty = json.dumps({"verdict": "PASS", "summary": "x", "complete": False, "findings": []})
+        found = json.dumps(
+            {"verdict": "FAIL", "summary": "found one", "complete": True,
+             "findings": [{"file": "a.ts", "title": "Bug", "details": "x"}]}
+        )
+        result, verdict, limits = self.run_sequence([
+            (0, empty, '{"status":"done","limit":null,"usage":{"cost":0.5}}'),
+            (0, found, '{"status":"done","limit":null,"usage":{"cost":0.3}}'),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2", "1.5000"])
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertAlmostEqual(verdict["usage"]["cost"], 0.8)
+
+    def test_empty_review_retry_that_times_out_is_incomplete_not_an_error(self):
+        empty = json.dumps({"verdict": "PASS", "summary": "x", "complete": False, "findings": []})
+        result, verdict, limits = self.run_sequence([
+            (0, empty, '{"status":"done","limit":null,"usage":{"cost":0.5}}'),
+            (124, "", ""),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(limits), 2)
+        self.assertEqual(verdict["verdict"], "INCOMPLETE")
+        self.assertIn("ran out of time", verdict["summary"])
+
+    def test_empty_review_is_not_retried_without_budget(self):
+        empty = json.dumps({"verdict": "PASS", "summary": "x", "complete": False, "findings": []})
+        result, verdict, limits = self.run_sequence([
+            (0, empty, '{"status":"done","limit":null,"usage":{"cost":1.95}}'),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "INCOMPLETE")
+        self.assertIn("did not review the diff", verdict["summary"])
+
+    def test_no_retry_with_less_than_a_third_of_the_time_left(self):
+        # A 1-minute limit is under the 2-minute floor for a retry.
+        result, verdict, limits = self.run_sequence(
+            [(1, "", '{"status":"error","message":"boom","usage":{"cost":0.1}}')], timeout="1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "ERROR")
+        self.assertIn("too little", result.stdout)
+
+    def test_turn_limit_without_an_answer_names_the_turn_limit(self):
+        result, verdict, _limits = self.run_sequence(
+            [(3, "", '{"status":"limit","limit":"turns","usage":{"cost":0.4}}')]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verdict["verdict"], "INCOMPLETE")
+        self.assertIn("turn limit", verdict["summary"])
 
     def test_rejected_configuration_becomes_an_error_verdict(self):
         result, verdict = self.run_check(2)
@@ -912,6 +1080,818 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(limits, ["2"])
         self.assertEqual(verdict["verdict"], "ERROR")
         self.assertIn("finished without writing an answer", verdict["summary"])
+
+
+class DepsPlanTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, rel: str, text: str = "") -> None:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def plan(self, *changed: str) -> list[tuple[str, str]]:
+        return [(s["ecosystem"], s["dir"]) for s in checks.deps_plan(self.root, list(changed))]
+
+    def rows(self, steps: list[dict]) -> list[tuple[str, str, str, str]]:
+        rows = []
+        for step in steps:
+            if step["action"] == "run":
+                rows.append((step["ecosystem"], step["deps"], "ok", ""))
+            else:
+                rows.append((step["ecosystem"], step["deps"], step["status"], step["reason"]))
+        return rows
+
+    def test_nearest_lockfile_in_a_repository_without_workspaces(self):
+        self.write("package-lock.json", "{}")
+        self.write("packages/a/package-lock.json", "{}")
+        self.write("packages/a/src/x.ts")
+        self.assertEqual(self.plan("packages/a/src/x.ts", "tools/y.js"), [("npm", "packages/a"), ("npm", "")])
+
+    def test_files_that_are_not_code_install_nothing(self):
+        self.write("package-lock.json", "{}")
+        self.write("pyproject.toml", "[project]\nname='x'\n")
+        self.assertEqual(self.plan("README.md", "docs/guide.md", ".github/workflows/ci.yml"), [])
+
+    def test_only_the_ecosystem_of_the_changed_file(self):
+        # A Python helper in a TypeScript repository installs Python only.
+        self.write("package-lock.json", "{}")
+        self.write("requirements.txt", "requests==2.32.3\n")
+        self.assertEqual(self.plan("scripts/tool.py"), [("pip", "")])
+        self.assertEqual(self.plan("src/a.ts"), [("npm", "")])
+
+    def test_dotnet_is_not_installed(self):
+        self.write("App.sln")
+        self.write("App.csproj")
+        self.write("global.json", '{"sdk": {"version": "8.0.403"}}')
+        steps = checks.deps_plan(self.root, ["Program.cs"])
+        self.assertFalse(any(step["action"] == "run" for step in steps))
+        self.assertEqual([(step["ecosystem"], step["status"]) for step in steps], [("nuget", "unsupported")])
+        text = checks.render_dependencies(self.rows(steps))
+        self.assertIn("NuGet is not installed", text)
+        self.assertIn("runs project code", text)
+        self.assertNotIn("dotnet", text)
+        self.assertNotIn("App.sln", text)
+
+    def test_java_does_not_schedule_maven_or_gradle(self):
+        self.write("pom.xml")
+        self.write("app/build.gradle")
+        steps = checks.deps_plan(self.root, ["app/src/A.java"])
+        self.assertFalse(any(step["action"] == "run" for step in steps))
+        self.assertEqual(
+            [(step["ecosystem"], step["status"]) for step in steps],
+            [("maven", "unsupported"), ("gradle", "unsupported")],
+        )
+        text = checks.render_dependencies(self.rows(steps))
+        self.assertIn("Maven and Gradle are not installed", text)
+        self.assertNotIn("mvn", text)
+        self.assertNotIn("gradlew", text)
+
+    def test_other_ecosystems(self):
+        self.write("go.mod", "module x\n\ngo 1.23.4\n")
+        self.write("Cargo.toml")
+        self.write("Cargo.lock")
+        self.write("pom.xml")
+        self.write("mod/pom.xml")
+        plan = {s["ecosystem"]: s for s in checks.deps_plan(self.root, ["a.go", "src/lib.rs", "mod/src/A.java"])}
+        self.assertEqual(plan["go"]["image"], "golang:1.23")
+        self.assertEqual(plan["go"]["argv"], ["go", "mod", "download"])
+        self.assertEqual(plan["go"]["prelude"], "go-cache")
+        self.assertEqual(plan["go"]["env"]["GOPROXY"], "file:///cache/go,https://proxy.golang.org")
+        self.assertEqual(plan["go"]["env"]["GOTOOLCHAIN"], "local")
+        # From /tmp, cargo reads no .cargo/config.toml and rustup no rust-toolchain.toml.
+        self.assertEqual(plan["cargo"]["argv"], ["cargo", "fetch", "--locked", "--manifest-path", "/work/Cargo.toml"])
+        self.assertEqual((plan["cargo"]["cwd"], plan["cargo"]["prelude"]), ("tmp", "cargo-cache"))
+        self.assertEqual(plan["maven"]["status"], "unsupported")
+        self.assertEqual(plan["gradle"]["status"], "unsupported")
+
+    def test_pip_installs_wheels_from_a_requirements_file(self):
+        self.write("a/requirements.txt", "requests==2.32.3\n")
+        self.write("b/requirements-dev.txt", "pytest==8.3.0\n")
+        steps = {step["dir"]: step for step in checks.deps_plan(self.root, ["a/x.py", "b/y.py"])}
+        # pip reads the rebuilt list from /reqs, never the pull request's file.
+        self.assertEqual(
+            steps["a"]["argv"],
+            [
+                "pip", "install", "--target", "/work/.checks-deps/python/a", "--only-binary", ":all:",
+                "--no-input", "--disable-pip-version-check", "--cache-dir", "/cache/pip",
+                "-r", "/reqs/requirements.txt",
+            ],
+        )
+        self.assertEqual(steps["a"]["files"], {"requirements.txt": "requests==2.32.3\n"})
+        self.assertEqual((steps["a"]["cwd"], steps["a"]["image"]), ("tmp", "python:3.13"))
+        self.assertEqual(steps["a"]["deps"], ".checks-deps/python/a")
+        self.assertEqual(steps["b"]["files"], {"requirements.txt": "pytest==8.3.0\n"})
+        self.assertEqual(steps["b"]["deps"], ".checks-deps/python/b")
+
+    def test_pyproject_without_requirements_is_skipped(self):
+        self.write("pyproject.toml", "[project]\nname='x'\n")
+        steps = checks.deps_plan(self.root, ["a.py"])
+        self.assertEqual([(step["action"], step["reason"]) for step in steps], [("skip", "no-requirements")])
+        self.assertNotIn("pip install", json.dumps(steps))
+        text = checks.render_dependencies(self.rows(steps))
+        self.assertIn("no requirements file", text)
+        self.assertIn("would run project code", text)
+        self.assertNotIn("`pyproject.toml`", text)
+
+    def test_cargo_without_a_lockfile_is_skipped(self):
+        self.write("Cargo.toml", "[package]\nname='x'\nversion='0.1.0'\n")
+        steps = checks.deps_plan(self.root, ["src/lib.rs"])
+        self.assertEqual([(step["action"], step["reason"]) for step in steps], [("skip", "no-lock")])
+        self.assertNotIn("cargo fetch", json.dumps(steps))
+
+    def test_unsafe_project_paths_are_not_planned_or_shown(self):
+        self.write("package-lock.json", "{}")
+        steps = checks.deps_plan(self.root, ["bad'name/a.ts", "bad\nname/b.ts"])
+        blob = json.dumps(steps)
+        self.assertNotIn("bad'name", blob)
+        self.assertNotIn("bad\nname", blob)
+        self.assertTrue(steps)
+        self.assertTrue(all(step["reason"] == "unsafe-path" for step in steps))
+        text = checks.render_dependencies(self.rows(steps))
+        self.assertNotIn("bad", text)
+        self.assertIn("cannot be installed safely", text)
+
+    def test_node_version_from_nvmrc_and_engines(self):
+        self.write("a/package-lock.json", "{}")
+        self.write("a/.nvmrc", "v20.11.0\n")
+        self.write("b/package-lock.json", "{}")
+        self.write("b/package.json", '{"engines": {"node": ">=24.1"}}')
+        images = {s["dir"]: s["image"] for s in checks.deps_plan(self.root, ["a/x.js", "b/y.ts"])}
+        self.assertEqual(images, {"a": "node:20", "b": "node:24"})
+
+    def test_pnpm_and_yarn_lockfiles(self):
+        self.write("p/pnpm-lock.yaml", "lockfileVersion: '9.0'\n")
+        self.write("y/yarn.lock", "# yarn lockfile v1\n")
+        self.write("z/yarn.lock", "__metadata:\n  version: 8\n")
+        commands = {s["dir"]: s for s in checks.deps_plan(self.root, ["p/a.ts", "y/a.ts", "z/a.ts"])}
+        # The action picks the package manager; packageManager and Corepack don't.
+        self.assertEqual((commands["p"]["prelude"], commands["p"]["tool"]), ("tool", "pnpm@9.15.9"))
+        self.assertIn("--ignore-scripts", commands["p"]["argv"])
+        self.assertIn("--ignore-pnpmfile", commands["p"]["argv"])
+        self.assertEqual(commands["p"]["env"]["npm_config_manage_package_manager_versions"], "false")
+        self.assertEqual((commands["y"]["prelude"], commands["y"]["tool"]), ("tool", "yarn@1.22.22"))
+        self.assertIn("--ignore-scripts", commands["y"]["argv"])
+        self.assertIn("--no-default-rc", commands["y"]["argv"])
+        self.assertEqual(commands["y"]["env"]["YARN_IGNORE_PATH"], "1")
+        # Yarn 2+ writes .yarn/ and .pnp.cjs beside the lockfile; the checkout is read-only.
+        self.assertEqual((commands["z"]["action"], commands["z"]["reason"]), ("skip", "layout"))
+
+    def test_pnpm_workspace_packages_get_their_own_node_modules(self):
+        self.write("pnpm-workspace.yaml", "packages:\n  - 'pkgs/*'\n")
+        self.write(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  pkgs/x:\n    dependencies:\n"
+            "      ms:\n        specifier: 2.1.3\n        version: 2.1.3\n\n  'pkgs/y': {}\n\npackages:\n\n  ms@2.1.3: {}\n",
+        )
+        (step,) = checks.deps_plan(self.root, ["pkgs/x/a.ts"])
+        self.assertEqual(step["action"], "run")
+        self.assertEqual(step["dir"], "")
+        self.assertEqual(step["extra_node_modules"], ["pkgs/x/node_modules", "pkgs/y/node_modules"])
+
+    def test_npm_packages_that_could_not_be_hoisted_get_their_node_modules(self):
+        self.write("app/package-lock.json", json.dumps({"packages": {
+            "": {}, "node_modules/ms": {}, "node_modules/a/node_modules/b": {},
+            "ws/one/node_modules/ms": {}, "../linked": {},
+        }}))
+        (step,) = checks.deps_plan(self.root, ["app/ws/one/x.ts"])
+        self.assertEqual(step["dir"], "app")
+        self.assertEqual(step["extra_node_modules"], ["app/ws/one/node_modules"])
+
+    def test_a_workspace_outside_the_project_is_not_installed(self):
+        self.write("p/pnpm-lock.yaml", "lockfileVersion: '9.0'\nimporters:\n\n  .: {}\n\n  ../../escape: {}\n")
+        (step,) = checks.deps_plan(self.root, ["p/a.ts"])
+        self.assertEqual((step["action"], step["reason"]), ("skip", "layout"))
+
+    def test_symlinked_planning_files_are_not_read(self):
+        outside = self.root.parent / f"{self.root.name}-outside"
+        outside.mkdir()
+        self.addCleanup(shutil.rmtree, outside)
+        (outside / "nvmrc").write_text("18\n")
+        self.write("a/package-lock.json", "{}")
+        (self.root / "a" / ".nvmrc").symlink_to(outside / "nvmrc")
+        (step,) = checks.deps_plan(self.root, ["a/x.ts"])
+        self.assertEqual(step["image"], "node:22")
+
+    def test_git_dependencies_are_not_installed(self):
+        # Packing a git dependency runs its prepare script.
+        self.write("n/package-lock.json", json.dumps({"packages": {"node_modules/x": {
+            "resolved": "git+ssh://git@github.com/o/x.git#abc", "version": "1.0.0"}}}))
+        self.write("p/pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages:\n\n  x@1.0.0:\n    resolution: {commit: abc, repo: https://github.com/o/x.git, type: git}\n")
+        self.write("g/pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages:\n\n  x@1.0.0:\n    resolution: {tarball: https://codeload.github.com/o/x/tar.gz/abc}\n")
+        self.write("y/yarn.lock", '# yarn lockfile v1\n\nx@o/x:\n  version "1.0.0"\n  resolved "git+https://github.com/o/x.git#abc"\n')
+        steps = checks.deps_plan(self.root, ["n/a.ts", "p/a.ts", "g/a.ts", "y/a.ts"])
+        self.assertEqual(
+            sorted((s["dir"], s["action"], s["reason"]) for s in steps),
+            [("g", "skip", "git-dependency"), ("n", "skip", "git-dependency"),
+             ("p", "skip", "git-dependency"), ("y", "skip", "git-dependency")],
+        )
+
+    def test_registry_lockfiles_install_and_a_package_named_like_git_is_not_one(self):
+        self.write("n/package-lock.json", json.dumps({"packages": {"node_modules/simple-git": {
+            "resolved": "https://registry.npmjs.org/simple-git/-/simple-git-3.0.0.tgz", "version": "3.0.0"}}}))
+        self.write("p/pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages:\n\n  simple-git@3.0.0:\n    resolution: {integrity: sha512-x}\n")
+        self.write("y/yarn.lock", '# yarn lockfile v1\n\nsimple-git@^3:\n  version "3.0.0"\n  resolved "https://registry.yarnpkg.com/simple-git/-/simple-git-3.0.0.tgz"\n')
+        steps = checks.deps_plan(self.root, ["n/a.ts", "p/a.ts", "y/a.ts"])
+        self.assertEqual(sorted((s["dir"], s["action"]) for s in steps), [("n", "run"), ("p", "run"), ("y", "run")])
+        npm = next(s for s in steps if s["dir"] == "n")
+        self.assertIn("--install-links=false", npm["argv"])
+        # npm ci --ignore-scripts still runs a linked file: package's prepare.
+        self.assertIn("--script-shell=/bin/true", npm["argv"])
+
+    def test_pnpm_version_follows_the_lockfile(self):
+        self.write("a/pnpm-lock.yaml", "lockfileVersion: '6.0'\n")
+        self.write("b/pnpm-lock.yaml", "lockfileVersion: 5.4\n")
+        self.write("c/pnpm-lock.yaml", "lockfileVersion: 3\n")
+        steps = {s["dir"]: s for s in checks.deps_plan(self.root, ["a/x.ts", "b/x.ts", "c/x.ts"])}
+        self.assertEqual(steps["a"]["tool"], "pnpm@8.15.9")
+        self.assertEqual(steps["b"]["tool"], "pnpm@7.33.7")
+        self.assertEqual((steps["c"]["action"], steps["c"]["reason"]), ("skip", "lockfile-version"))
+
+    def test_yarn_and_npm_workspaces_get_their_node_modules(self):
+        self.write("y/yarn.lock", "# yarn lockfile v1\n")
+        self.write("y/package.json", json.dumps({"workspaces": {"packages": ["packages/*"], "nohoist": ["**/x"]}}))
+        self.write("y/packages/a/package.json", "{}")
+        self.write("y/packages/b/package.json", "{}")
+        self.write("y/packages/notes/README.md", "no package.json")
+        self.write("n/package-lock.json", "{}")
+        self.write("n/package.json", json.dumps({"workspaces": ["apps/*", "!apps/skip"]}))
+        self.write("n/apps/web/package.json", "{}")
+        steps = {s["dir"]: s for s in checks.deps_plan(self.root, ["y/packages/a/i.ts", "n/apps/web/i.ts"])}
+        self.assertEqual(steps["y"]["extra_node_modules"], ["y/packages/a/node_modules", "y/packages/b/node_modules"])
+        self.assertEqual(steps["n"]["extra_node_modules"], ["n/apps/web/node_modules"])
+
+    def test_a_workspace_pattern_that_leaves_the_project_is_not_installed(self):
+        self.write("y/yarn.lock", "# yarn lockfile v1\n")
+        self.write("y/package.json", json.dumps({"workspaces": ["../other/*"]}))
+        (step,) = checks.deps_plan(self.root, ["y/i.ts"])
+        self.assertEqual((step["action"], step["reason"]), ("skip", "layout"))
+
+    def test_a_symlinked_workspace_package_is_not_mounted(self):
+        outside = self.root.parent / f"{self.root.name}-ws"
+        (outside / "pkg").mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, outside)
+        (outside / "pkg" / "package.json").write_text("{}")
+        self.write("y/yarn.lock", "# yarn lockfile v1\n")
+        self.write("y/package.json", json.dumps({"workspaces": ["packages/*"]}))
+        self.write("y/packages/real/package.json", "{}")
+        (self.root / "y" / "packages" / "link").symlink_to(outside / "pkg")
+        (step,) = checks.deps_plan(self.root, ["y/i.ts"])
+        self.assertEqual(step["extra_node_modules"], ["y/packages/real/node_modules"])
+
+    def requirements(self, text: str, **others: str):
+        self.write("svc/requirements.txt", text)
+        for name, body in others.items():
+            self.write(name.replace("__", "/").replace("_", "-") + ".txt", body)
+        return checks.parse_requirements(self.root, "svc/requirements.txt")
+
+    def test_requirements_keep_pins_extras_markers_and_hashes(self):
+        reqs, cons, dropped = self.requirements(
+            "# pinned\nrequests[socks]==2.32.3 ; python_version >= \"3.8\"  # comment\n"
+            "urllib3>=2,<3 \\\n    --hash=sha256:abcdef0123\nDjango~=5.0\n"
+        )
+        self.assertEqual(reqs, [
+            'requests[socks]==2.32.3 ; python_version >= "3.8"',
+            "urllib3>=2,<3 --hash=sha256:abcdef0123",
+            "Django~=5.0",
+        ])
+        self.assertEqual((cons, dropped), ([], 0))
+
+    def test_requirements_follow_includes_and_constraints(self):
+        self.write("base.txt", "attrs==24.2.0\n")
+        self.write("svc/constraints.txt", "idna<4\n")
+        reqs, cons, dropped = self.requirements("-r ../base.txt\n--constraint=constraints.txt\nrequests\n")
+        self.assertEqual((reqs, cons, dropped), (["attrs==24.2.0", "requests"], ["idna<4"], 0))
+
+    def test_editable_path_and_url_requirements_are_dropped(self):
+        reqs, _cons, dropped = self.requirements(
+            "-e .\n--editable=../lib\n./wheels/x.whl\nhttps://example.com/x.tar.gz\n"
+            "pkg @ git+https://github.com/o/pkg\nrequests==2.32.3\n"
+        )
+        self.assertEqual((reqs, dropped), (["requests==2.32.3"], 5))
+
+    def test_options_that_change_what_pip_runs_refuse_the_file(self):
+        for line in ("--no-binary :all:", "--only-binary=:none:", "--index-url https://evil.example/simple",
+                     "--extra-index-url https://x", "-f ./wheels", "--pre", "pkg==${VERSION}", "pkg --config-settings x=y"):
+            with self.subTest(line=line):
+                self.assertEqual(self.requirements(f"requests\n{line}\n"), "requirements-options")
+
+    def test_an_include_outside_the_repository_or_through_a_symlink_is_refused(self):
+        self.assertEqual(self.requirements("-r ../../outside.txt\n"), "requirements-options")
+        outside = self.root.parent / f"{self.root.name}-req.txt"
+        outside.write_text("evil\n")
+        self.addCleanup(outside.unlink)
+        self.write("svc/placeholder", "")
+        (self.root / "svc" / "linked.txt").symlink_to(outside)
+        self.assertEqual(self.requirements("-r linked.txt\n"), "requirements-options")
+
+    def test_pip_step_records_dropped_lines_and_writes_constraints(self):
+        self.write("svc/requirements.txt", "-e .\nrequests\n-c c.txt\n")
+        self.write("svc/c.txt", "idna<4\n")
+        (step,) = checks.deps_plan(self.root, ["svc/app.py"])
+        self.assertEqual(step["note"], "partial")
+        self.assertEqual(step["files"], {"requirements.txt": "requests\n", "constraints.txt": "idna<4\n"})
+        self.assertEqual(step["argv"][-2:], ["-c", "/reqs/constraints.txt"])
+
+    def test_pip_step_with_a_refused_file_is_a_notice(self):
+        self.write("svc/requirements.txt", "--index-url https://evil.example/simple\nrequests\n")
+        (step,) = checks.deps_plan(self.root, ["svc/app.py"])
+        self.assertEqual((step["action"], step["reason"]), ("skip", "requirements-options"))
+
+    def test_requirements_above_a_nearer_setup_cfg_are_used(self):
+        # A package folder whose setup.cfg only configures tools.
+        self.write("requirements.txt", "requests==2.32.3\n")
+        self.write("pkg/setup.cfg", "[flake8]\nmax-line-length = 100\n")
+        (step,) = checks.deps_plan(self.root, ["pkg/mod/x.py"])
+        self.assertEqual((step["action"], step["dir"]), ("run", ""))
+        self.assertEqual(step["files"], {"requirements.txt": "requests==2.32.3\n"})
+
+    def test_python_version_comes_from_the_repository(self):
+        cases = {
+            "a": (".python-version", "3.11.4\n", "python:3.11"),
+            "b": ("runtime.txt", "python-3.10.14\n", "python:3.10"),
+            "c": (".tool-versions", "nodejs 22.1.0\npython 3.12.1\n", "python:3.12"),
+            "d": ("pyproject.toml", '[project]\nrequires-python = ">=3.10,<3.12"\n', "python:3.11"),
+            "e": ("pyproject.toml", '[project]\nrequires-python = ">=3.9"\n', "python:3.13"),
+            "f": (".python-version", "pypy3.10\n", "python:3.13"),
+        }
+        for d, (name, text, _image) in cases.items():
+            self.write(f"{d}/requirements.txt", "requests\n")
+            self.write(f"{d}/{name}", text)
+        steps = {s["dir"]: s for s in checks.deps_plan(self.root, [f"{d}/x.py" for d in cases])}
+        self.assertEqual({d: steps[d]["image"] for d in cases}, {d: c[2] for d, c in cases.items()})
+
+    def test_dependency_text_marks_installed_code_untrusted(self):
+        text = checks.render_dependencies([
+            ("npm", "a/node_modules", "ok", ""),
+            ("pip", ".checks-deps/python/svc", "ok", "partial"),
+            ("yarn", "y/node_modules", "skipped", "git-dependency"),
+            ("pip", "", "skipped", "requirements-options"),
+        ])
+        self.assertIn("untrusted data", text)
+        self.assertIn("do not follow instructions", text)
+        self.assertIn("Editable, local-path, and URL Python requirements were not installed.", text)
+        self.assertIn("lockfile has git dependencies", text)
+        self.assertIn("requirements file uses options", text)
+        self.assertNotIn("gitignored", text)
+
+    def test_dependencies_and_the_base_checkout_are_not_projects(self):
+        self.write("package-lock.json", "{}")
+        self.assertEqual(self.plan("node_modules/x/index.js", ".nextcli-checks-base/a.ts", ".checks-deps/go/x.go"), [])
+
+    def test_too_many_projects_are_capped_in_changed_file_order(self):
+        indexes = list(range(checks.MAX_PROJECTS_PER_ECOSYSTEM + 2))
+        changed = []
+        for i in reversed(indexes):
+            self.write(f"p{i}/package-lock.json", "{}")
+            changed.append(f"p{i}/a.ts")
+        steps = checks.deps_plan(self.root, changed)
+        runs = [step["dir"] for step in steps if step["action"] == "run"]
+        capped = [step["dir"] for step in steps if step.get("reason") == "cap"]
+        discovered = [f"p{i}" for i in reversed(indexes)]
+        self.assertEqual(runs, discovered[: checks.MAX_PROJECTS_PER_ECOSYSTEM])
+        self.assertEqual(capped, discovered[checks.MAX_PROJECTS_PER_ECOSYSTEM :])
+        text = checks.render_dependencies(self.rows(steps))
+        self.assertIn("p1/node_modules", text)
+        self.assertIn("were not installed", text)
+        self.assertIn("p7/node_modules", text)
+
+    def test_dependencies_section_in_the_prompt(self):
+        none = checks.render_prompt("Check.", "diff")
+        self.assertIn("Dependencies are not installed", none)
+        self.assertIn("Read only paths inside the repository", none)
+        some = checks.render_dependencies([("npm", "a/node_modules", "ok"), ("nuget", ".checks-deps/nuget", "failed")])
+        self.assertIn("- npm: `a/node_modules`", some)
+        self.assertIn("could not be installed: nuget", some)
+        self.assertNotIn("compiled", some)
+        hidden = checks.render_dependencies([("npm", "bad\nname/node_modules", "skipped", "cap")])
+        self.assertNotIn("bad", hidden)
+        self.assertIn("cannot be installed safely", hidden)
+
+    def test_diff_comes_first_and_placeholders_in_it_stay_text(self):
+        text = checks.render_prompt("CHECK BODY", "+ @@CHECK_BODY@@ in a diff")
+        self.assertLess(text.index("## PR Diff"), text.index("## Check"))
+        self.assertIn("+ @@CHECK_BODY@@ in a diff", text)
+        self.assertEqual(text.count("CHECK BODY"), 1)
+
+
+class InstallWantedTest(unittest.TestCase):
+    """Dependencies are installed only for a check that runs its agent and wants them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        (self.dir / "review.md").write_text("---\nname: Review\n---\nReview.\n")
+        (self.dir / "migrations.md").write_text("---\nname: M\npaths:\n  - \"**/*.sql\"\ninstall: auto\n---\nM.\n")
+        (self.dir / "style.md").write_text("---\nname: Style\ninstall: none\n---\nS.\n")
+        self.changed = self.dir / "changed.txt"
+        self.changed.write_text("src/a.ts\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def wanted(self, default: str, only: str = "") -> str:
+        result = subprocess.run(
+            ["python3", str(Path(__file__).parent / "checks.py"), "install-wanted",
+             "--dir", str(self.dir), "--only", only, "--changed", str(self.changed), "--default", default],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_the_input_applies_to_a_check_that_does_not_say(self):
+        self.assertEqual(self.wanted("auto", "review"), "auto")
+        self.assertEqual(self.wanted("none", "review"), "none")
+
+    def test_a_check_skipped_by_its_paths_installs_nothing(self):
+        self.assertEqual(self.wanted("auto", "migrations"), "none")
+        self.changed.write_text("db/1.sql\n")
+        self.assertEqual(self.wanted("none", "migrations"), "auto")
+
+    def test_a_check_can_turn_it_off(self):
+        self.assertEqual(self.wanted("auto", "style"), "none")
+
+    def test_any_check_of_the_job_that_wants_it(self):
+        self.assertEqual(self.wanted("auto"), "auto")
+        self.assertEqual(self.wanted("none"), "none")
+
+    def test_an_unknown_value_is_none(self):
+        self.assertEqual(self.wanted("yes", "review"), "none")
+
+
+class InstallDepsTest(unittest.TestCase):
+    """install-deps.sh with a fake docker that records what it was asked."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.workspace = root / "work"
+        (self.workspace / "pkg" / "src").mkdir(parents=True)
+        (self.workspace / "pkg" / "package-lock.json").write_text("{}")
+        (self.workspace / ".git").mkdir()
+        (self.workspace / ".nextcli-checks-base" / ".checks").mkdir(parents=True)
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.calls = root / "docker-calls"
+        self.cache = root / "cache"
+        timeout = self.bin / "timeout"
+        # GNU timeout isn't on macOS: drop the options and the duration.
+        timeout.write_text('#!/usr/bin/env bash\nwhile [[ "$1" == -* ]]; do shift; done\nshift\nexec "$@"\n')
+        timeout.chmod(0o755)
+        self.changed = Path("/tmp/changed-files.txt")
+        self.results = Path("/tmp/checks-deps.txt")
+        self.summary = root / "summary.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        for path in (self.changed, self.results):
+            path.unlink(missing_ok=True)
+
+    def run_install(self, docker_exit: int = 0, mode: str = "auto"):
+        docker = self.bin / "docker"
+        docker.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            f"[ \"$1\" = run ] && exit {docker_exit}\n"
+            "exit 0\n"
+        )
+        docker.chmod(0o755)
+        self.changed.write_text("pkg/src/a.ts\nREADME.md\n")
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "GITHUB_WORKSPACE": str(self.workspace),
+            "GITHUB_STEP_SUMMARY": str(self.summary),
+            "CHECKS_INSTALL": mode,
+            "CHECKS_DEPS_CACHE": str(self.cache),
+            "PROVIDER_API_KEY": "sk-secret-value",
+        }
+        result = subprocess.run(
+            ["bash", str(Path(__file__).parent / "install-deps.sh")],
+            env=env, capture_output=True, text=True,
+        )
+        calls = self.calls.read_text().splitlines() if self.calls.exists() else []
+        return result, calls
+
+    def test_installs_in_a_container_without_secrets(self):
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (run,) = [c for c in calls if c.startswith("run ")]
+        self.assertIn("node:22", run)
+        self.assertIn("--read-only", run)
+        self.assertIn("--cap-drop=ALL", run)
+        self.assertIn("--security-opt=no-new-privileges", run)
+        self.assertIn("--pids-limit=256", run)
+        self.assertIn(f"-v {self.workspace}:/work:ro", run)
+        self.assertIn(f"-v {self.workspace}/pkg/node_modules:/work/pkg/node_modules", run)
+        self.assertIn("-w /work/pkg", run)
+        self.assertNotIn(".git:/work/.git", run)
+        script, command = run.split(" -c ", 1)[1].split(" -- ", 1)
+        self.assertIn("npm ci --ignore-scripts", command)
+        self.assertNotIn("a.ts", script)
+        self.assertNotIn("pkg", script)
+        self.assertNotIn("package-lock", script)
+        self.assertNotIn("sk-secret-value", run)
+        self.assertNotIn("PROVIDER_API_KEY", run)
+        self.assertNotIn("docker.sock", run)
+        self.assertEqual(self.results.read_text(), "npm\tpkg/node_modules\tok\t\n")
+        self.assertEqual((self.workspace / ".checks-deps" / ".gitignore").read_text(), "*\n")
+        self.assertIn("installed in", self.summary.read_text())
+
+    def test_a_failed_install_is_a_warning(self):
+        result, _calls = self.run_install(docker_exit=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("::warning::Could not install npm", result.stdout)
+        self.assertEqual(self.results.read_text(), "npm\tpkg/node_modules\tfailed\t\n")
+
+    def test_yarn_classic_installs_pinned_yarn_without_putting_the_project_in_the_shell(self):
+        (self.workspace / "pkg" / "package-lock.json").unlink()
+        (self.workspace / "pkg" / "yarn.lock").write_text("# yarn lockfile v1\n")
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (run,) = [c for c in calls if c.startswith("run ")]
+        script, command = run.split(" -c ", 1)[1].split('exec "$@" -- ', 1)
+        self.assertIn('(cd /tmp && npm install --global --prefix /tmp/home/tools', script)
+        self.assertIn("-e CHECKS_TOOL=yarn@1.22.22", run)
+        self.assertIn("-e YARN_IGNORE_PATH=1", run)
+        self.assertNotIn("corepack", run)
+        self.assertIn("--ignore-scripts", command)
+        self.assertIn("--no-default-rc", command)
+        self.assertNotIn("a.ts", script)
+        self.assertNotIn("yarn.lock", script)
+        self.assertNotIn("pkg", script)
+
+    def test_symlinked_node_modules_is_not_mounted_or_written(self):
+        victim = Path(self.tmp.name) / "checks"
+        victim.mkdir()
+        (victim / "review.md").write_text("keep")
+        (self.workspace / "pkg" / "node_modules").symlink_to(victim)
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in calls if c.startswith("run ")], [])
+        self.assertIn("::warning::Skipping npm in pkg", result.stdout)
+        self.assertEqual(self.results.read_text(), "npm\tpkg/node_modules\tskipped\tunsafe-path\n")
+        self.assertEqual(sorted(p.name for p in victim.iterdir()), ["review.md"])
+
+    def test_symlinked_deps_dir_is_not_written_through(self):
+        victim = Path(self.tmp.name) / "elsewhere"
+        victim.mkdir()
+        (self.workspace / ".checks-deps").symlink_to(victim)
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in calls if c.startswith("run ")], [])
+        self.assertEqual(list(victim.iterdir()), [])
+        self.assertIn("unsafe-path", self.results.read_text())
+
+    def test_a_symlinked_parent_of_node_modules_is_refused(self):
+        real = Path(self.tmp.name) / "real-pkg"
+        (self.workspace / "pkg").rename(real)
+        (self.workspace / "pkg").symlink_to(real)
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in calls if c.startswith("run ")], [])
+        self.assertFalse((real / "node_modules").exists())
+
+    def test_workspace_packages_are_mounted_writable(self):
+        (self.workspace / "pkg" / "package-lock.json").unlink()
+        (self.workspace / "pkg" / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\nimporters:\n\n  .: {}\n\n  libs/one: {}\n")
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (run,) = [c for c in calls if c.startswith("run ")]
+        self.assertIn(f"-v {self.workspace}:/work:ro", run)
+        self.assertIn(f"-v {self.workspace}/pkg/node_modules:/work/pkg/node_modules", run)
+        self.assertIn(f"-v {self.workspace}/pkg/libs/one/node_modules:/work/pkg/libs/one/node_modules", run)
+        self.assertTrue((self.workspace / "pkg" / "libs" / "one" / "node_modules").is_dir())
+        self.assertEqual(self.results.read_text(), "pnpm\tpkg/node_modules\tok\t\n")
+
+    def test_pip_reads_the_rebuilt_list_from_a_read_only_mount(self):
+        (self.workspace / "pkg" / "package-lock.json").unlink()
+        (self.workspace / "pkg" / "requirements.txt").write_text("-e .\nrequests==2.32.3\n")
+        listing = Path(self.tmp.name) / "reqs-seen"
+        docker = self.bin / "docker"
+        # The fake docker copies what is mounted at /reqs, as the container sees it.
+        docker.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            '[ "$1" = run ] || exit 0\n'
+            'while [ $# -gt 0 ]; do case "$1" in -v) case "$2" in *:/reqs:ro) '
+            f"cat \"${{2%%:/reqs:ro}}/requirements.txt\" > '{listing}';; esac;; esac; shift; done\n"
+        )
+        docker.chmod(0o755)
+        self.changed.write_text("pkg/src/a.py\n")
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "GITHUB_WORKSPACE": str(self.workspace),
+            "GITHUB_STEP_SUMMARY": str(self.summary),
+            "CHECKS_INSTALL": "auto",
+            "CHECKS_DEPS_CACHE": str(self.cache),
+        }
+        result = subprocess.run(["bash", str(Path(__file__).parent / "install-deps.sh")], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (run,) = [c for c in self.calls.read_text().splitlines() if c.startswith("run ")]
+        self.assertIn(":/reqs:ro", run)
+        self.assertIn("-w /tmp", run)
+        self.assertIn("python:3.13", run)
+        self.assertNotIn("pkg/requirements.txt", run)
+        self.assertEqual(listing.read_text(), "requests==2.32.3\n")
+        self.assertEqual(self.results.read_text(), "pip\t.checks-deps/python/pkg\tok\tpartial\n")
+        self.assertIn("editable, path, and URL requirements skipped", self.summary.read_text())
+
+    def test_node_modules_is_gitignored_after_the_install(self):
+        result, _calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.workspace / "pkg" / "node_modules" / ".gitignore").read_text(), "*\n")
+        self.assertEqual((self.workspace / ".checks-deps" / ".gitignore").read_text(), "*\n")
+
+    def test_a_gitignore_link_left_by_the_container_is_not_written_through(self):
+        victim = Path(self.tmp.name) / "victim.txt"
+        victim.write_text("keep")
+        docker = self.bin / "docker"
+        docker.write_text(
+            "#!/usr/bin/env bash\n"
+            '[ "$1" = run ] || exit 0\n'
+            f"ln -s '{victim}' '{self.workspace}/pkg/node_modules/.gitignore'\n"
+            f"ln -sf '{victim}' '{self.workspace}/.checks-deps/.gitignore'\n"
+        )
+        docker.chmod(0o755)
+        self.changed.write_text("pkg/src/a.ts\n")
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "GITHUB_WORKSPACE": str(self.workspace),
+            "CHECKS_INSTALL": "auto",
+            "CHECKS_DEPS_CACHE": str(self.cache),
+        }
+        result = subprocess.run(["bash", str(Path(__file__).parent / "install-deps.sh")], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(victim.read_text(), "keep")
+        ignore = self.workspace / "pkg" / "node_modules" / ".gitignore"
+        self.assertFalse(ignore.is_symlink())
+        self.assertEqual(ignore.read_text(), "*\n")
+        self.assertFalse((self.workspace / ".checks-deps" / ".gitignore").is_symlink())
+
+    def test_install_none_runs_nothing(self):
+        result, calls = self.run_install(mode="none")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.results.read_text(), "")
+
+
+class NextcliAgentArgsTest(unittest.TestCase):
+    """nextcli.sh passes the turn limit to cn."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.args = root / "args"
+        cn = self.bin / "cn"
+        cn.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > '{self.args}'\n")
+        cn.chmod(0o755)
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("Check.")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_agent(self, max_turns: str) -> list[str]:
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "PROVIDER_API_KEY": "k",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "CHECKS_BASE_URL": "https://example.invalid/v1",
+            "CHECKS_MAX_TURNS": max_turns,
+        }
+        result = subprocess.run(
+            ["bash", str(Path(__file__).parent / "agents" / "nextcli.sh"), str(self.prompt)],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.args.read_text().splitlines()
+
+    def test_turn_limit_is_passed(self):
+        args = self.run_agent("60")
+        self.assertEqual(args[args.index("--max-turns") + 1], "60")
+
+    def test_zero_turns_means_no_limit(self):
+        self.assertNotIn("--max-turns", self.run_agent("0"))
+        self.assertNotIn("--max-turns", self.run_agent(""))
+
+
+class ReportRetryTest(unittest.TestCase):
+    """A check run can 404 for a moment after it is created."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.calls = root / "calls"
+        self.verdict = root / "verdict.json"
+        self.verdict.write_text(json.dumps({
+            "verdict": "SKIP",
+            "summary": "No changed files match this check's paths.",
+            "complete": True,
+            "findings": [],
+        }))
+        self.done = Path("/tmp/check-runs-done.txt")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        self.done.unlink(missing_ok=True)
+
+    def write_gh(self, body: str) -> None:
+        gh = self.bin / "gh"
+        gh.write_text("#!/usr/bin/env bash\n" + body)
+        gh.chmod(0o755)
+
+    def run_report(self) -> subprocess.CompletedProcess[str]:
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "GITHUB_REPOSITORY": "nextcli-dev/nextcli-checks",
+            "CHECKS_GH_RETRY_DELAY": "0",
+            "HOME": str(self.tmp.name),
+        }
+        return subprocess.run(
+            ["bash", str(Path(__file__).parent / "report.sh"), "migration-safety", str(self.verdict), "129918725399"],
+            env=env, capture_output=True, text=True,
+        )
+
+    def test_a_404_is_retried_until_the_update_succeeds(self):
+        self.write_gh(
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            f"n=$(wc -l < '{self.calls}' | tr -d ' ')\n"
+            "if [ \"$n\" -lt 3 ]; then echo 'gh: Not Found (HTTP 404)' >&2; exit 1; fi\n"
+            "exit 0\n"
+        )
+        result = self.run_report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 3)
+        self.assertIn("retrying", result.stderr)
+        self.assertIn("129918725399", self.done.read_text())
+
+    def test_a_server_error_is_retried(self):
+        self.write_gh(
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            f"n=$(wc -l < '{self.calls}' | tr -d ' ')\n"
+            "if [ \"$n\" -lt 2 ]; then echo 'gh: Server Error (HTTP 502)' >&2; exit 1; fi\n"
+            "exit 0\n"
+        )
+        result = self.run_report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 2)
+
+    def test_without_a_run_id_the_run_is_created_completed_in_one_call(self):
+        body = Path(self.tmp.name) / "body.json"
+        self.write_gh(
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            'while [ $# -gt 0 ]; do [ "$1" = --input ] && cp "$2" ' + f"'{body}'" + '; shift; done\n'
+        )
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "GITHUB_REPOSITORY": "nextcli-dev/nextcli-checks",
+            "HEAD_SHA": "f4a953d",
+            "CHECKS_GH_RETRY_DELAY": "0",
+            "HOME": str(self.tmp.name),
+        }
+        result = subprocess.run(
+            ["bash", str(Path(__file__).parent / "report.sh"), "migration-safety", str(self.verdict), ""],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (call,) = self.calls.read_text().splitlines()
+        self.assertNotIn("PATCH", call)
+        self.assertIn("repos/nextcli-dev/nextcli-checks/check-runs", call)
+        sent = json.loads(body.read_text())
+        self.assertEqual(sent["name"], "check/migration-safety")
+        self.assertEqual(sent["head_sha"], "f4a953d")
+        self.assertEqual((sent["status"], sent["conclusion"]), ("completed", "success"))
+
+    def test_without_a_run_id_or_a_commit_nothing_is_sent(self):
+        self.write_gh(f"printf '%s\\n' \"$*\" >> '{self.calls}'\n")
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "HOME": str(self.tmp.name)}
+        result = subprocess.run(
+            ["bash", str(Path(__file__).parent / "report.sh"), "migration-safety", str(self.verdict), ""],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_a_non_404_is_not_retried(self):
+        self.write_gh(
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            "echo 'gh: Bad credentials (HTTP 401)' >&2\n"
+            "exit 1\n"
+        )
+        result = self.run_report()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+        self.assertNotIn("retrying", result.stderr)
 
 
 if __name__ == "__main__":

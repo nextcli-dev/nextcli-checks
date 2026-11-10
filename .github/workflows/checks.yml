@@ -19,8 +19,10 @@
 # Set `checks: anti-slop,review` to run only those checks, for example from a
 # repository variable, to control what a pull request costs.
 #
-# The jobs below use nextcli-dev/nextcli-checks@v3. Release this file and the
-# action together, and move the v3 tag for both.
+# The jobs below use `$/`, the action at the root of this repository at the
+# same commit as this workflow. That still resolves here when another
+# repository calls the workflow, and it does not need a checkout. Release
+# this file and the action together, and move the v3 tag for both.
 name: AI Checks
 
 on:
@@ -50,6 +52,14 @@ on:
         description: Output tokens one model call may produce, thinking included (nextcli only). Empty uses the provider's default (4,096 on DeepSeek).
         type: string
         default: ""
+      max-turns:
+        description: Model calls one check may make (nextcli only). At the limit the agent reports what it found so far. Empty allows one call per 20 seconds of the time left, at most 60. 0 for no limit.
+        type: string
+        default: ""
+      install:
+        description: none (default) or auto. auto installs the dependencies of the projects that hold the changed files, in throwaway containers, so the agent can read libraries. A check's `install:` frontmatter overrides it.
+        type: string
+        default: none
       check:
         description: Run only this check (file name without .md). Empty runs every check in checks-dir.
         type: string
@@ -109,7 +119,7 @@ jobs:
       - name: List checks
         id: list
         if: steps.config.outputs.enabled == 'true'
-        uses: nextcli-dev/nextcli-checks@v3
+        uses: $/
         with:
           mode: list
           pr-number: ${{ inputs.pr-number }}
@@ -144,9 +154,10 @@ jobs:
     needs: discover
     if: needs.discover.outputs.checks != '[]' && needs.discover.outputs.checks != ''
     runs-on: ubuntu-latest
-    # Covers agent install and one check. timeout-per-check covers the check's
-    # first run and its retry together, so keep it below this.
-    timeout-minutes: 30
+    # Covers agent install, dependency install (at most 6 minutes) and one
+    # check. timeout-per-check covers the check's first run and its retry
+    # together, so keep it at least 10 minutes below this.
+    timeout-minutes: 40
     permissions:
       contents: read
       pull-requests: write
@@ -156,7 +167,7 @@ jobs:
       matrix:
         check: ${{ fromJson(needs.discover.outputs.checks) }}
     steps:
-      - uses: nextcli-dev/nextcli-checks@v3
+      - uses: $/
         with:
           mode: run
           check: ${{ matrix.check }}
@@ -170,6 +181,8 @@ jobs:
           api-key: ${{ secrets.api-key }}
           max-cost: ${{ inputs.max-cost }}
           max-output-tokens: ${{ inputs.max-output-tokens }}
+          max-turns: ${{ inputs.max-turns }}
+          install: ${{ inputs.install }}
           timeout-per-check: ${{ inputs.timeout-per-check }}
           on-error: ${{ inputs.on-error }}
 
@@ -191,7 +204,7 @@ jobs:
           path: ${{ runner.temp }}/check-results
           merge-multiple: true
 
-      - uses: nextcli-dev/nextcli-checks@v3
+      - uses: $/
         with:
           mode: comment
           pr-number: ${{ inputs.pr-number }}

@@ -141,7 +141,7 @@ Leave `base-url` empty for a named provider unless you need a gateway. Set `CHEC
 
 ### Inputs
 
-The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-cost`, `max-output-tokens`, `check`, `checks`, `base-url`, `checks-dir`, `pr-number`, `timeout-per-check` and `on-error`, and the `api-key` secret. `check` limits the matrix to one check and fails if that check does not exist. `checks` limits it to a comma-separated list of checks and skips, with a warning, any that does not exist; use it with a repository variable to control what a run costs. `max-cost` is a dollar cap per check (default `1`); it is enforced by `nextcli` and other agents print a notice that they ignore it. A run that exits at the cap is not retried. A `nextcli` run that ends without a verdict is retried once with what it left of the cap, so a review costs at most one cap. With `mode: comment` the action renders the combined comment from downloaded verdict files. `mode: list` only outputs the check names as a JSON array.
+The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-cost`, `max-output-tokens`, `max-turns`, `install`, `check`, `checks`, `base-url`, `checks-dir`, `pr-number`, `timeout-per-check` and `on-error`, and the `api-key` secret. `check` limits the matrix to one check and fails if that check does not exist. `checks` limits it to a comma-separated list of checks and skips, with a warning, any that does not exist; use it with a repository variable to control what a run costs. `max-cost` is a dollar cap per check (default `1`); it is enforced by `nextcli` and other agents print a notice that they ignore it. `max-turns` caps the model calls per check (`nextcli` only); empty, the default, allows one call per 20 seconds of the time left, at most 60, so the turn cap comes before the timeout. A run that stops at a cap and still gives a verdict keeps it, marked partial, and is not retried. A partial pass does not count as a successful check run. A `nextcli` run that ends without a verdict, or with one that reviewed nothing, is retried once with what it left of the cost cap, so a review costs at most one cap, and only when a third of `timeout-per-check` is left. With `mode: comment` the action renders the combined comment from downloaded verdict files. `mode: list` only outputs the check names as a JSON array.
 
 | Input | Default | Description |
 | --- | --- | --- |
@@ -149,6 +149,8 @@ The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-
 | `agent-version` | empty | Version of the agent CLI to install. Defaults to `opencode-ai` 1.19.5, `@anthropic-ai/claude-code` 2.1.312, or `@nextcli/cli` 0.8.1. An installed `cn` at another version is replaced. |
 | `max-cost` | `1` | Dollar cap per check. `nextcli` stops at the cap and still returns a result; the comment marks that review partial. Other agents ignore it. |
 | `max-output-tokens` | empty | Output tokens one model call may produce, thinking included (`nextcli` only). Empty uses the provider's default, which is 4,096 on DeepSeek and can be used up by thinking before the answer. |
+| `max-turns` | empty | Model calls one check may make (`nextcli` only). At the limit the agent reports what it found so far; the comment marks that review partial. Empty allows one call per 20 seconds of the time left, at most 60. `0` for no limit. |
+| `install` | `none` | `auto` installs the dependencies of the projects that hold the changed files, so the agent reads libraries inside the repository. A check's `install:` frontmatter overrides it. See [Dependencies](#dependencies). |
 | `nextcli-ref` | empty | Branch, tag, or commit SHA of NextCLI to build from source when `agent` is `nextcli`. When set, `agent-version` is ignored for `nextcli`. |
 | `nextcli-repository` | `https://github.com/nextcli-dev/nextcli.git` | Repository cloned when `nextcli-ref` is set. |
 | `timeout-per-check` | `10` | Minutes allowed for each check, its retry included, before it is reported as an error. |
@@ -159,6 +161,31 @@ The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-
 | `checks-dir` | `.checks` | Directory of check markdown files, relative to the repository root, read from the base commit. |
 | `pr-number` | event's PR | Pull request to check. Required when the workflow is not triggered by a pull request. |
 | `mode` | `run` | `run` runs and reports checks. `comment` posts or updates the combined pull request comment. `list` only sets the `checks` output. |
+
+### Dependencies
+
+With `install: auto`, each check job installs the dependencies of the projects that hold the changed files before the agent starts. Without them the agent can't read a library the change uses, and spends its turns searching the runner for it. The default is `none`. A check can set `install: auto` or `install: none` in its frontmatter, which overrides the input for that check. Nothing is installed for a check that its `paths` skip.
+
+- **What is installed.** A changed file selects the ecosystems of its own kind (a `.ts` file JavaScript, a `.py` file pip, a README selects none) and the nearest project above it: npm, pnpm, or Yarn 1 by lockfile (workspace packages included), pip (the nearest `requirements*.txt`), Go (`go mod download`), and Cargo (`cargo fetch --locked` when `Cargo.lock` is present). At most six projects per ecosystem, in the order the changed files name them; the rest are listed in the prompt as not installed.
+- **What is not installed.**
+  - NuGet, Maven, and Gradle: restoring them runs project code.
+  - Yarn 2+: it writes `.yarn/` and `.pnp.cjs` into the read-only checkout.
+  - A JavaScript lockfile with git dependencies: packing one runs its `prepare` script.
+  - A requirements file with options (`--no-binary`, `--index-url`, and the like): they change what pip builds or where packages come from.
+- **Nothing from the pull request runs.** No file or setting in the repository can make the install run code or choose the program that does:
+  - pnpm and Yarn 1 run at versions the action pins (`pnpm@9.15.9`, `8.15.9`, or `7.33.7` by lockfile version; `yarn@1.22.22`), installed from the public registry outside the project. Corepack and the `packageManager` field are not used.
+  - npm, pnpm, and Yarn run with scripts off. npm also runs with `--script-shell=/bin/true`, because `npm ci --ignore-scripts` still runs a linked `file:` package's `prepare`, and with `--install-links=false`. pnpm runs with `--ignore-pnpmfile`. Yarn runs with `--no-default-rc` and `YARN_IGNORE_PATH=1`, so a `.yarnrc` can neither add arguments nor hand off to a `yarn-path`.
+  - pip never reads the pull request's requirements file. The action rebuilds the list (package names, versions, markers, hashes, and `-r` and `-c` includes inside the repository), drops editable, path, and URL requirements, and installs wheels only.
+  - Cargo runs from outside the project with `--manifest-path`, so no `.cargo/config.toml` or `rust-toolchain.toml` is read. Go uses the toolchain in the image (`GOTOOLCHAIN=local`).
+  - `scripts/test_containers.py` checks each of these against real package managers.
+- **Where.** JavaScript packages go to the `node_modules` of the project and its workspace packages. pip, Go, and Cargo go to `.checks-deps/` in the repository. Each of these gets a `.gitignore` of `*` after the install, so Search skips them. The prompt lists the locations; read a library by that path. The prompt also tells the agent that this code is untrusted, like the diff. The agent can't run it: unattended, `cn` denies interpreters, `npx`, and programs named by a path.
+- **How.** Each install runs in a throwaway container from the official image (`node`, `python`, `golang`, `rust`):
+  - The image tag comes from `.nvmrc` or `engines` for Node, `go.mod` for Go, and `.python-version`, `runtime.txt`, `.tool-versions`, or `requires-python` for Python (default 3.13).
+  - The checkout is mounted read-only. The only writable paths are `.checks-deps` and the `node_modules` directories. Each must be a plain directory of the checkout, or not exist yet: an install is skipped when one is a symlink, a file, or has files from the pull request in it.
+  - The container gets no secrets, no runner files, and no Docker socket.
+  - The checks are read from a copy outside the workspace, made before anything is installed.
+- **Cache.** Downloads for every ecosystem (npm, pnpm, Yarn, pip, Go modules, Cargo crates and index) are cached by lockfile hash. Each package manager checks what it takes from the cache against the lockfile or the index. The cache is saved only from `pull_request` runs, so it is read only by later runs of the same pull request.
+- **Limits.** Six minutes for all installs in a job, including image pulls. A failed or skipped install is a warning, never a failed check, and the prompt says which libraries are missing. The job summary lists each install and its time.
 
 The `nextcli` agent installs `@nextcli/cli` from npm, pinned to `agent-version`. To run unreleased NextCLI code instead, set `nextcli-ref` and the action builds `cn` from source. The build adds several minutes to each job:
 

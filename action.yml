@@ -47,6 +47,14 @@ inputs:
     description: Output tokens one model call may produce, thinking included, for the nextcli agent. Empty uses the provider's default, which is 4,096 on DeepSeek and can be used up by thinking before the answer is written.
     required: false
     default: ""
+  max-turns:
+    description: Model calls one check may make, for the nextcli agent. At the limit the agent reports what it found so far, and the comment marks the review as partial. Empty (default) allows one call per 20 seconds of the time left, at most 60, so the turn limit comes before timeout-per-check. 0 for no limit. Other agents ignore it.
+    required: false
+    default: ""
+  install:
+    description: none (default) or auto. auto installs the dependencies of the projects that hold the changed files, so the agent can read a library inside the repository instead of searching the runner for it. npm, pnpm, and Yarn 1 (scripts, pnpmfiles, and git dependencies off; pnpm and Yarn at pinned versions), pip (a rebuilt requirements list, wheels only), Go, and Cargo run in a throwaway container. The checkout is read-only and nothing from the pull request runs. NuGet, Maven, Gradle, and Yarn 2+ are not installed. A check can set `install:` in its frontmatter to override this. Nothing is installed for a check that its paths skip. A failed install is a warning.
+    required: false
+    default: none
   results-dir:
     description: In comment mode, the directory that holds the check-*.verdict.json files from the run jobs, usually their downloaded check-results artifacts.
     required: false
@@ -138,6 +146,21 @@ runs:
         fetch-depth: 1
         persist-credentials: false
 
+    # The checks are read from a copy outside the workspace, made before
+    # anything is installed. The install container mounts the checkout
+    # read-only and does not run project code.
+    - name: Copy the checks out of the workspace
+      if: inputs.mode == 'run'
+      shell: bash
+      env:
+        SOURCE: ${{ github.workspace }}/.nextcli-checks-base/${{ inputs.checks-dir }}
+        TARGET: ${{ runner.temp }}/nextcli-checks
+      run: |
+        if [ -d "$SOURCE" ]; then
+          mkdir -p "$TARGET"
+          cp -R "$SOURCE/." "$TARGET/"
+        fi
+
     - name: List checks
       id: list
       if: inputs.mode == 'list'
@@ -192,6 +215,59 @@ runs:
         CHECKS_MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
       run: bash "$GITHUB_ACTION_PATH/scripts/prepare-diff.sh"
 
+    # Install only when a check this job runs will run its agent and wants
+    # dependencies (its `install:` frontmatter, else the install input).
+    - name: Decide whether to install dependencies
+      id: install
+      if: inputs.mode == 'run' && steps.bot.outputs.skip != 'true'
+      shell: bash
+      env:
+        CHECKS_DIR: ${{ runner.temp }}/nextcli-checks
+        CHECKS_ONLY: ${{ inputs.check }}
+        CHECKS_INSTALL: ${{ inputs.install }}
+      run: |
+        changed=()
+        if [ -f /tmp/changed-files.txt ]; then
+          changed=(--changed /tmp/changed-files.txt)
+        fi
+        wanted="$(python3 "$GITHUB_ACTION_PATH/scripts/checks.py" install-wanted \
+          --dir "$CHECKS_DIR" --only "$CHECKS_ONLY" --default "$CHECKS_INSTALL" ${changed[@]+"${changed[@]}"})"
+        echo "install=${wanted}" >> "$GITHUB_OUTPUT"
+        echo "Dependency install: ${wanted}"
+
+    # Download caches for every ecosystem (npm, pnpm, Yarn, pip, Go, Cargo).
+    # Each package manager checks what it takes from here against the
+    # lockfile or the index, so an older cache from restore-keys only costs
+    # space. It is saved only from pull_request runs, whose caches only that
+    # pull request reads; a workflow_dispatch run would save to the default
+    # branch, which every pull request reads.
+    - name: Restore dependency downloads
+      id: deps-cache
+      if: inputs.mode == 'run' && steps.install.outputs.install == 'auto'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/checks-deps-cache
+        key: checks-deps-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/requirements*.txt', '**/go.sum', '**/Cargo.lock') }}
+        restore-keys: checks-deps-${{ runner.os }}-
+
+    # Downloads dependencies in throwaway containers. The checkout is read-only,
+    # project code does not run, and this step gets no secrets. NuGet, Maven,
+    # Gradle, and Yarn 2+ are not installed.
+    - name: Install dependencies
+      if: inputs.mode == 'run' && steps.install.outputs.install == 'auto'
+      shell: bash
+      env:
+        CHECKS_INSTALL: auto
+        CHECKS_DEPS_CACHE: ${{ runner.temp }}/checks-deps-cache
+      run: bash "$GITHUB_ACTION_PATH/scripts/install-deps.sh"
+
+    - name: Save dependency downloads
+      if: always() && inputs.mode == 'run' && steps.install.outputs.install == 'auto' && github.event_name == 'pull_request' && steps.deps-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/checks-deps-cache
+        key: ${{ steps.deps-cache.outputs.cache-primary-key }}
+
     - name: Run checks
       if: inputs.mode == 'run'
       shell: bash
@@ -204,9 +280,10 @@ runs:
         CHECKS_TIMEOUT: ${{ inputs.timeout-per-check }}
         CHECKS_MAX_COST: ${{ inputs.max-cost }}
         CHECKS_MAX_OUTPUT_TOKENS: ${{ inputs.max-output-tokens }}
+        CHECKS_MAX_TURNS: ${{ inputs.max-turns }}
         CHECKS_ON_ERROR: ${{ inputs.on-error }}
         CHECKS_ONLY: ${{ inputs.check }}
-        CHECKS_DIR: ${{ github.workspace }}/.nextcli-checks-base/${{ inputs.checks-dir }}
+        CHECKS_DIR: ${{ runner.temp }}/nextcli-checks
         CHECKS_SKIP_REASON: ${{ steps.bot.outputs.skip == 'true' && 'The head commit was made by github-actions[bot].' || '' }}
         GH_TOKEN: ${{ github.token }}
         GH_REPO: ${{ github.repository }}

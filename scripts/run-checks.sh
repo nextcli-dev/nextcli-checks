@@ -3,6 +3,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=retry-gh.sh
+source "$script_dir/retry-gh.sh"
 checks_dir="${CHECKS_DIR:-.checks}"
 agent="${CHECKS_AGENT:-opencode}"
 
@@ -45,7 +47,7 @@ if [ -n "${CHECKS_SKIP_REASON:-}" ]; then
   for name in "${names[@]}"; do
     echo "check/${name}: skipped (${CHECKS_SKIP_REASON})"
     if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
-      gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
+      retry_gh gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
         -f "name=check/${name}" \
         -f "head_sha=${HEAD_SHA}" \
         -f status=completed \

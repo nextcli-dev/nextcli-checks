@@ -2,11 +2,15 @@
 # Run one check file. Path filters skip the agent and still publish a
 # successful check run, so a required status check does not stay pending.
 # A verdict that fails to parse is retried once. Configuration errors (exit 2)
-# and timeouts are not retried. CHECKS_TIMEOUT covers the first run and its
-# retry together, so a check fits in the job's time limit.
+# and timeouts are not retried, and neither is a run that stopped at a limit
+# (exit 3) but still gave a verdict: that verdict is kept as a partial review.
+# CHECKS_TIMEOUT covers the first run and its retry together, so a check fits
+# in the job's time limit.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=retry-gh.sh
+source "$script_dir/retry-gh.sh"
 check_file="${1:?check file is required}"
 
 if [ ! -f "$check_file" ]; then
@@ -39,17 +43,9 @@ trace_dir="/tmp/check-${name}.traces"
 rm -rf "$trace_dir"
 mkdir -p "$trace_dir"
 
+# A check that ends before its agent runs (below) has no check run yet;
+# report.sh creates it already completed.
 check_run_id=""
-if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
-  check_run_id="$(gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
-    -f "name=check/${name}" \
-    -f "head_sha=${HEAD_SHA}" \
-    -f status=in_progress \
-    --jq '.id')"
-  # close-check-runs.sh completes any run left in progress by a cancelled or
-  # timed-out job.
-  echo "$check_run_id" >> /tmp/check-runs-started.txt
-fi
 
 # Writes a verdict that isn't the agent's own: ERROR, SKIP or INCOMPLETE.
 write_verdict() {
@@ -74,11 +70,27 @@ if [ -z "$provider" ] || [ -z "$model" ]; then
   exit 0
 fi
 
+# The agent will run: show the check as in progress. close-check-runs.sh
+# completes this run if the job is cancelled or times out.
+if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+  check_run_id="$(retry_gh gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
+    -f "name=check/${name}" \
+    -f "head_sha=${HEAD_SHA}" \
+    -f status=in_progress \
+    --jq '.id')"
+  echo "$check_run_id" >> /tmp/check-runs-started.txt
+fi
+
 # The first run and its retry share one time limit.
 deadline=$((SECONDS + timeout_minutes * 60))
 
-# A retry needs at least this many seconds left to be worth starting.
-MIN_RETRY_SECONDS=120
+# A retry needs at least this much time left to be worth starting: a third of
+# the limit, and never less than two minutes. A retry that starts with too
+# little time is cut off by the timeout and ends with no result at all.
+MIN_RETRY_SECONDS=$((timeout_minutes * 60 / 3))
+if [ "$MIN_RETRY_SECONDS" -lt 120 ]; then
+  MIN_RETRY_SECONDS=120
+fi
 
 time_for_retry() {
   if [ $((deadline - SECONDS)) -ge "$MIN_RETRY_SECONDS" ]; then
@@ -87,6 +99,11 @@ time_for_retry() {
   echo "::notice::check/${name} has too little of its ${timeout_minutes} minutes left for a retry."
   return 1
 }
+
+# A model call takes about 15 seconds (82 calls in 21 minutes in nextcli run
+# 42693558895). 20 leaves room for tool calls and the final answer.
+SECONDS_PER_TURN=20
+MAX_DERIVED_TURNS=60
 
 run_agent() {
   local seconds_left=$((deadline - SECONDS))
@@ -99,14 +116,30 @@ run_agent() {
   elif [ "${1:-}" = "retry-empty" ]; then
     render_args+=(--retry-empty)
   fi
+  # install-deps.sh's results: which dependencies the agent can read.
+  if [ -f /tmp/checks-deps.txt ]; then
+    render_args+=(--deps /tmp/checks-deps.txt)
+  fi
   "${render_args[@]}" > "$prompt"
+  # Without an explicit max-turns, allow one model call per SECONDS_PER_TURN of
+  # the time left, at most MAX_DERIVED_TURNS, so the agent reaches its turn
+  # limit, and still answers, before the timeout kills it with no answer.
+  local max_turns="${CHECKS_MAX_TURNS:-}"
+  if [ -z "$max_turns" ]; then
+    max_turns=$((seconds_left / SECONDS_PER_TURN))
+    if [ "$max_turns" -gt "$MAX_DERIVED_TURNS" ]; then
+      max_turns=$MAX_DERIVED_TURNS
+    elif [ "$max_turns" -lt 1 ]; then
+      max_turns=1
+    fi
+  fi
   # The caller turns errexit off around this call. Don't touch it here: turning
   # it back on before the return below would exit the whole script on any
   # non-zero agent status (124 timeout, 3 limit, 2 bad configuration), before
   # a verdict is written.
   # The agent gets the provider key and nothing else secret: no GitHub token
   # and no Actions runtime tokens.
-  CHECKS_PROVIDER="$provider" CHECKS_MODEL="$model" CHECKS_TRACE_DIR="$trace_dir" \
+  CHECKS_PROVIDER="$provider" CHECKS_MODEL="$model" CHECKS_TRACE_DIR="$trace_dir" CHECKS_MAX_TURNS="$max_turns" \
     timeout "${seconds_left}s" \
     env -u GH_TOKEN -u GITHUB_TOKEN \
       -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL -u ACTIONS_RESULTS_URL -u ACTIONS_CACHE_URL \
@@ -133,8 +166,10 @@ fi
 # What an earlier run of this check cost, added to the reported usage.
 spent_before=0
 
-# Set when the parsed verdict has no findings and did not finish, while the
-# diff is non-empty. That is not a review of the change.
+# Set when the agent finished normally (not at a limit), but its verdict has
+# no findings and did not finish, while the diff is non-empty. That is not a
+# review of the change. At a limit, the same verdict is an honest partial
+# review: the agent worked until the limit and found nothing.
 review_was_empty=false
 
 # Turns one agent run into a verdict file. Returns 1 when the output has no
@@ -149,13 +184,14 @@ judge_run() {
     message="$(tail -n 1 "$err" 2>/dev/null || true)"
     write_error_verdict "${message:-The agent rejected this provider configuration.}"
   elif bash "$script_dir/parse-verdict.sh" < "$raw" > "$verdict_file"; then
-    if python3 "$script_dir/checks.py" empty-review --verdict "$verdict_file" --diff /tmp/pr-truncated.diff; then
+    if [ "$code" -ne "$LIMIT_EXIT" ] &&
+      python3 "$script_dir/checks.py" empty-review --verdict "$verdict_file" --diff /tmp/pr-truncated.diff; then
       review_was_empty=true
       return 1
     fi
     return 0
   elif [ "$code" -eq "$LIMIT_EXIT" ]; then
-    write_verdict INCOMPLETE "The agent stopped at its cost limit (\$${CHECKS_MAX_COST:-?}) before it returned a result."
+    write_verdict INCOMPLETE "$(python3 "$script_dir/checks.py" limit-message --stderr "$err" --max-cost "${CHECKS_MAX_COST:-}")"
   else
     return 1
   fi
@@ -169,15 +205,33 @@ set -e
 
 if ! judge_run "$code"; then
   if [ "$review_was_empty" = true ]; then
-    if ! time_for_retry; then
+    # With a cost limit, the retry gets only what the first run left of it,
+    # so both runs together stay within the limit.
+    retry_max_cost=""
+    retry_ok=true
+    if [ -n "${CHECKS_MAX_COST:-}" ] && [ "$agent" = "nextcli" ]; then
+      if budget="$(python3 "$script_dir/checks.py" retry-budget --stderr "$err" --max-cost "$CHECKS_MAX_COST")"; then
+        read -r retry_max_cost spent_before <<< "$budget"
+      else
+        retry_ok=false
+        echo "::notice::check/${name} did not review the diff and has too little of its \$${CHECKS_MAX_COST} cost limit left for a retry."
+      fi
+    fi
+    if [ "$retry_ok" != true ] || ! time_for_retry; then
       write_verdict INCOMPLETE "The agent did not review the diff."
     else
-      # A cost limit does not block this retry: the first result reviewed nothing.
       set +e
-      run_agent retry-empty
+      if [ -n "$retry_max_cost" ]; then
+        CHECKS_MAX_COST="$retry_max_cost" run_agent retry-empty
+      else
+        run_agent retry-empty
+      fi
       code=$?
       set -e
-      if ! judge_run "$code"; then
+      if [ "$code" -eq 124 ]; then
+        # Never trade the first result for a timeout.
+        write_verdict INCOMPLETE "The agent did not review the diff, and its retry ran out of time."
+      elif ! judge_run "$code"; then
         if [ "$review_was_empty" = true ]; then
           write_verdict INCOMPLETE "The agent did not review the diff."
         else
