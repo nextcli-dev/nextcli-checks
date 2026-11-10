@@ -6,6 +6,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=retry-gh.sh
+source "$script_dir/retry-gh.sh"
 name="${1:?check name is required}"
 verdict_file="${2:?verdict file is required}"
 check_run_id="${3:-}"
@@ -33,7 +35,7 @@ if [ -n "$check_run_id" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
     --repo "$GITHUB_REPOSITORY" \
     --sha "${HEAD_SHA:-}" \
     --verdict "$verdict_file" > "$patch"
-  gh api -X PATCH "repos/${GITHUB_REPOSITORY}/check-runs/${check_run_id}" --input "$patch" >/dev/null
+  retry_gh gh api -X PATCH "repos/${GITHUB_REPOSITORY}/check-runs/${check_run_id}" --input "$patch" >/dev/null
   rm -f "$patch"
   echo "$check_run_id" >> /tmp/check-runs-done.txt
 fi

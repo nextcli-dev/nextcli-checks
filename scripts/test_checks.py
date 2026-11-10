@@ -1352,5 +1352,69 @@ class NextcliAgentArgsTest(unittest.TestCase):
         self.assertNotIn("--max-turns", self.run_agent(""))
 
 
+class ReportRetryTest(unittest.TestCase):
+    """A check run can 404 for a moment after it is created."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.calls = root / "calls"
+        self.verdict = root / "verdict.json"
+        self.verdict.write_text(json.dumps({
+            "verdict": "SKIP",
+            "summary": "No changed files match this check's paths.",
+            "complete": True,
+            "findings": [],
+        }))
+        self.done = Path("/tmp/check-runs-done.txt")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        self.done.unlink(missing_ok=True)
+
+    def write_gh(self, body: str) -> None:
+        gh = self.bin / "gh"
+        gh.write_text("#!/usr/bin/env bash\n" + body)
+        gh.chmod(0o755)
+
+    def run_report(self) -> subprocess.CompletedProcess[str]:
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "GITHUB_REPOSITORY": "nextcli-dev/nextcli-checks",
+            "CHECKS_GH_RETRY_DELAY": "0",
+            "HOME": str(self.tmp.name),
+        }
+        return subprocess.run(
+            ["bash", str(Path(__file__).parent / "report.sh"), "migration-safety", str(self.verdict), "129918725399"],
+            env=env, capture_output=True, text=True,
+        )
+
+    def test_a_404_is_retried_until_the_update_succeeds(self):
+        self.write_gh(
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            f"n=$(wc -l < '{self.calls}' | tr -d ' ')\n"
+            "if [ \"$n\" -lt 3 ]; then echo 'gh: Not Found (HTTP 404)' >&2; exit 1; fi\n"
+            "exit 0\n"
+        )
+        result = self.run_report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 3)
+        self.assertIn("retrying", result.stderr)
+        self.assertIn("129918725399", self.done.read_text())
+
+    def test_a_non_404_is_not_retried(self):
+        self.write_gh(
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            "echo 'gh: Bad credentials (HTTP 401)' >&2\n"
+            "exit 1\n"
+        )
+        result = self.run_report()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+        self.assertNotIn("retrying", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

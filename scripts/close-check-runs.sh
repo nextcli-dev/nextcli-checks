@@ -3,6 +3,10 @@
 # because the job was cancelled or timed out. Runs as an always() step.
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=retry-gh.sh
+source "$script_dir/retry-gh.sh"
+
 started=/tmp/check-runs-started.txt
 done_file=/tmp/check-runs-done.txt
 [ -f "$started" ] || exit 0
@@ -15,7 +19,7 @@ while IFS= read -r id; do
     continue
   fi
   echo "Closing unfinished check run ${id}."
-  gh api -X PATCH "repos/${GITHUB_REPOSITORY}/check-runs/${id}" \
+  retry_gh gh api -X PATCH "repos/${GITHUB_REPOSITORY}/check-runs/${id}" \
     -f status=completed \
     -f conclusion=neutral \
     -f "output[title]=Did not finish" \
