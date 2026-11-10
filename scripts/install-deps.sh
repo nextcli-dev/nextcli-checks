@@ -4,13 +4,14 @@
 # caches and system folders on the runner.
 #
 # Each project is restored in a throwaway container from its ecosystem's
-# official image (see `checks.py deps-plan`). A restore can run code from the
-# pull request: dotnet restore targets, Gradle and setup.py scripts, and so on.
-# So the container gets no secrets, no runner files and no Docker socket. It
-# sees the workspace, with .git read-only, and a download cache. The checks
-# themselves are read from a copy outside the workspace (see action.yml).
+# official image (see `checks.py deps-plan`). The container does not run
+# project code: npm, pnpm, and yarn with scripts off, pip from a requirements
+# file with wheels only, go mod download, and cargo fetch --locked. NuGet,
+# Maven, and Gradle are not installed. The checkout is mounted read-only.
+# Writable mounts are .checks-deps and, for JavaScript, the project's
+# node_modules. No secrets, no runner files, no Docker socket.
 #
-# Writes /tmp/checks-deps.txt: ecosystem, dependency location, status per line,
+# Writes /tmp/checks-deps.txt: ecosystem, location, status, reason per line,
 # which run-check.sh turns into the prompt's Dependencies section.
 # A failed install is a warning, never a failed check.
 set -euo pipefail
@@ -41,10 +42,6 @@ if [ ! -f /tmp/changed-files.txt ]; then
   echo "No list of changed files. Dependencies are not installed."
   exit 0
 fi
-if ! command -v "$docker" >/dev/null 2>&1; then
-  echo "::warning::Docker is not available. Dependencies are not installed."
-  exit 0
-fi
 
 plan="$(python3 "$script_dir/checks.py" deps-plan --root "$workspace" --changed /tmp/changed-files.txt)"
 if [ -z "$plan" ]; then
@@ -52,42 +49,162 @@ if [ -z "$plan" ]; then
   exit 0
 fi
 
-mkdir -p "$workspace/.checks-deps" "$cache"
-# Search (rg) skips ignored files, so installed packages don't flood results.
-printf '*\n' > "$workspace/.checks-deps/.gitignore"
+# String or bool fields. argv and env are read separately so a value is never
+# parsed by this shell.
+json_get() {
+  python3 -c 'import json,sys; value=json.loads(sys.argv[1]).get(sys.argv[2], ""); print("" if value is None else "true" if value is True else "false" if value is False else value)' "$1" "$2"
+}
 
-mounts=(-v "$workspace:/work" -v "$cache:/cache")
-if [ -d "$workspace/.git" ]; then
-  mounts+=(-v "$workspace/.git:/work/.git:ro")
+record() {
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$results"
+}
+
+# Reject a project directory the planner should already have dropped.
+unsafe_dir() {
+  case "$1" in
+    "" ) return 1 ;;
+    *[!A-Za-z0-9._/-]*|/*|*//*) return 0 ;;
+    ..|../*|*/../*|*/..) return 0 ;;
+  esac
+  return 1
+}
+
+prepared=false
+prepare_workspace() {
+  if [ "$prepared" = true ]; then
+    return
+  fi
+  mkdir -p "$workspace/.checks-deps" "$cache"
+  # Search (rg) skips ignored files, so installed packages don't flood results.
+  printf '*\n' > "$workspace/.checks-deps/.gitignore"
+  prepared=true
+}
+
+docker_ok=true
+if ! command -v "$docker" >/dev/null 2>&1; then
+  docker_ok=false
 fi
-
+warned_docker=false
 summary_lines=()
-while IFS=$'\t' read -r ecosystem dir image deps env_list command; do
-  left=$((deadline - SECONDS))
-  if [ "$left" -lt 10 ]; then
-    echo "::warning::No time left to install ${ecosystem} dependencies in ${dir}."
-    printf '%s\t%s\t%s\n' "$ecosystem" "$deps" skipped >> "$results"
-    summary_lines+=("| ${ecosystem} | \`${dir}\` | skipped, no time left |")
+
+while IFS= read -r line || [ -n "$line" ]; do
+  [ -z "$line" ] && continue
+  action="$(json_get "$line" action)"
+  ecosystem="$(json_get "$line" ecosystem)"
+  dir="$(json_get "$line" dir)"
+  deps="$(json_get "$line" deps)"
+  project="."
+  if [ -n "$dir" ]; then
+    project="$dir"
+  fi
+
+  if [ "$action" = "skip" ]; then
+    status="$(json_get "$line" status)"
+    reason="$(json_get "$line" reason)"
+    record "$ecosystem" "$deps" "$status" "$reason"
+    if [ "$status" = "unsupported" ]; then
+      summary_lines+=("| ${ecosystem} | — | not installed, would run project code |")
+    elif [ "$reason" = "cap" ]; then
+      summary_lines+=("| ${ecosystem} | \`${project}\` | skipped, past the project cap |")
+    elif [ "$reason" = "no-time" ]; then
+      summary_lines+=("| ${ecosystem} | \`${project}\` | skipped, no time left |")
+    else
+      summary_lines+=("| ${ecosystem} | — | skipped (${reason}) |")
+    fi
     continue
   fi
 
+  if [ "$dir" != "" ] && unsafe_dir "$dir"; then
+    echo "::warning::Skipping ${ecosystem}: project path cannot be installed safely."
+    record "$ecosystem" "" skipped unsafe-path
+    summary_lines+=("| ${ecosystem} | — | skipped (unsafe-path) |")
+    continue
+  fi
+
+  if [ "$docker_ok" != true ]; then
+    if [ "$warned_docker" != true ]; then
+      echo "::warning::Docker is not available. Dependencies are not installed."
+      warned_docker=true
+    fi
+    record "$ecosystem" "$deps" failed no-docker
+    summary_lines+=("| ${ecosystem} | \`${project}\` | failed, docker is not available |")
+    continue
+  fi
+
+  left=$((deadline - SECONDS))
+  if [ "$left" -lt 10 ]; then
+    echo "::warning::No time left to install ${ecosystem} dependencies in ${project}."
+    record "$ecosystem" "$deps" skipped no-time
+    summary_lines+=("| ${ecosystem} | \`${project}\` | skipped, no time left |")
+    continue
+  fi
+
+  image="$(json_get "$line" image)"
+  prelude="$(json_get "$line" prelude)"
+  mount_nm="$(json_get "$line" mount_node_modules)"
+  case "$prelude" in
+    "")
+      script='mkdir -p /tmp/home && exec "$@"'
+      ;;
+    corepack)
+      script='mkdir -p /tmp/home/bin && { corepack enable --install-directory /tmp/home/bin 2>/dev/null || npx --yes corepack enable --install-directory /tmp/home/bin; } && export PATH=/tmp/home/bin:$PATH && exec "$@"'
+      ;;
+    corepack-yarn1)
+      script='mkdir -p /tmp/home/bin && { corepack enable --install-directory /tmp/home/bin 2>/dev/null || npx --yes corepack enable --install-directory /tmp/home/bin; } && export PATH=/tmp/home/bin:$PATH && corepack prepare yarn@1.22.22 --activate && exec "$@"'
+      ;;
+    *)
+      echo "::warning::Unknown install prelude for ${ecosystem}. Dependencies in ${project} were not installed."
+      record "$ecosystem" "$deps" failed prelude
+      summary_lines+=("| ${ecosystem} | \`${project}\` | failed (unknown prelude) |")
+      continue
+      ;;
+  esac
+
+  argv=()
+  while IFS= read -r -d '' arg; do
+    argv+=("$arg")
+  done < <(python3 -c 'import json,sys; data=json.loads(sys.argv[1]); items=[item.encode() for item in data.get("argv") or []]; sys.stdout.buffer.write(b"\0".join(items) + (b"\0" if items else b""))' "$line")
   env_args=(-e HOME=/tmp/home -e CI=1)
-  for pair in $env_list; do
-    env_args+=(-e "$pair")
-  done
+  while IFS= read -r -d '' pair; do
+    [ -n "$pair" ] && env_args+=(-e "$pair")
+  done < <(python3 -c 'import json,sys; data=json.loads(sys.argv[1]); items=[f"{key}={value}".encode() for key, value in (data.get("env") or {}).items()]; sys.stdout.buffer.write(b"\0".join(items) + (b"\0" if items else b""))' "$line")
+
+  prepare_workspace
+  if [ -n "$dir" ]; then
+    workdir="/work/${dir}"
+  else
+    workdir="/work"
+  fi
+  mounts=(-v "$workspace:/work:ro" -v "$cache:/cache" -v "$workspace/.checks-deps:/work/.checks-deps")
+  if [ "$mount_nm" = "true" ]; then
+    if [ -n "$dir" ]; then
+      host_nm="$workspace/$dir/node_modules"
+      work_nm="/work/$dir/node_modules"
+    else
+      host_nm="$workspace/node_modules"
+      work_nm="/work/node_modules"
+    fi
+    mkdir -p "$host_nm"
+    mounts+=(-v "$host_nm:$work_nm")
+  fi
+
   container="checks-deps-$$-${RANDOM}"
   started=$SECONDS
-
-  echo "::group::Install ${ecosystem} dependencies in ${dir} (${image})"
+  echo "::group::Install ${ecosystem} dependencies in ${project} (${image})"
   set +e
   timeout --kill-after=10 "${left}s" \
     "$docker" run --rm --name "$container" \
       --user "$(id -u):$(id -g)" \
+      --read-only \
+      --cap-drop=ALL \
+      --security-opt=no-new-privileges \
+      --pids-limit=256 \
+      --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777 \
       "${env_args[@]}" \
       "${mounts[@]}" \
-      -w "/work/${dir}" \
+      -w "$workdir" \
       --entrypoint sh \
-      "$image" -c "mkdir -p /tmp/home && ${command}"
+      "$image" -c "$script" -- "${argv[@]}"
   code=$?
   set -e
   # timeout stops the client, not the container.
@@ -96,15 +213,14 @@ while IFS=$'\t' read -r ecosystem dir image deps env_list command; do
 
   took=$((SECONDS - started))
   if [ "$code" -eq 0 ]; then
-    status=ok
-    echo "Installed ${ecosystem} dependencies in ${dir} in ${took} s."
-    summary_lines+=("| ${ecosystem} | \`${dir}\` | installed in ${took} s |")
+    echo "Installed ${ecosystem} dependencies in ${project} in ${took} s."
+    record "$ecosystem" "$deps" ok ""
+    summary_lines+=("| ${ecosystem} | \`${project}\` | installed in ${took} s |")
   else
-    status=failed
-    echo "::warning::Could not install ${ecosystem} dependencies in ${dir} (exit ${code}). The checks run without them."
-    summary_lines+=("| ${ecosystem} | \`${dir}\` | failed (exit ${code}) after ${took} s |")
+    echo "::warning::Could not install ${ecosystem} dependencies in ${project} (exit ${code}). The checks run without them."
+    record "$ecosystem" "$deps" failed ""
+    summary_lines+=("| ${ecosystem} | \`${project}\` | failed (exit ${code}) after ${took} s |")
   fi
-  printf '%s\t%s\t%s\n' "$ecosystem" "$deps" "$status" >> "$results"
 done <<< "$plan"
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ "${#summary_lines[@]}" -gt 0 ]; then

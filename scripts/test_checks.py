@@ -294,6 +294,8 @@ class ConfigTest(unittest.TestCase):
 
     def test_conclusion(self):
         self.assertEqual(checks.conclusion_for("PASS", "neutral"), "success")
+        self.assertEqual(checks.conclusion_for("PASS", "neutral", complete=False), "neutral")
+        self.assertEqual(checks.conclusion_for("FAIL", "neutral", complete=False), "failure")
         self.assertEqual(checks.conclusion_for("SKIP", "failure"), "success")
         self.assertEqual(checks.conclusion_for("FAIL", "neutral"), "failure")
         self.assertEqual(checks.conclusion_for("ERROR", "neutral"), "neutral")
@@ -845,6 +847,7 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "FAIL")
         self.assertFalse(verdict["complete"])
         self.assertEqual(len(verdict["findings"]), 1)
+        self.assertEqual(checks.conclusion_for(verdict["verdict"], "neutral", verdict["complete"]), "failure")
 
     def test_unfinished_verdict_with_no_findings_is_not_a_review(self):
         # A run that finished on its own (exit 0) and looked at nothing.
@@ -899,6 +902,7 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "PASS")
         self.assertFalse(verdict["complete"])
         self.assertEqual(verdict["limit"], "cost")
+        self.assertEqual(checks.conclusion_for(verdict["verdict"], "neutral", verdict["complete"]), "neutral")
 
     def test_empty_review_is_retried_with_the_budget_left(self):
         empty = json.dumps({"verdict": "PASS", "summary": "x", "complete": False, "findings": []})
@@ -1032,11 +1036,20 @@ class DepsPlanTest(unittest.TestCase):
     def plan(self, *changed: str) -> list[tuple[str, str]]:
         return [(s["ecosystem"], s["dir"]) for s in checks.deps_plan(self.root, list(changed))]
 
+    def rows(self, steps: list[dict]) -> list[tuple[str, str, str, str]]:
+        rows = []
+        for step in steps:
+            if step["action"] == "run":
+                rows.append((step["ecosystem"], step["deps"], "ok", ""))
+            else:
+                rows.append((step["ecosystem"], step["deps"], step["status"], step["reason"]))
+        return rows
+
     def test_nearest_lockfile_in_a_repository_without_workspaces(self):
         self.write("package-lock.json", "{}")
         self.write("packages/a/package-lock.json", "{}")
         self.write("packages/a/src/x.ts")
-        self.assertEqual(self.plan("packages/a/src/x.ts", "tools/y.js"), [("npm", ""), ("npm", "packages/a")])
+        self.assertEqual(self.plan("packages/a/src/x.ts", "tools/y.js"), [("npm", "packages/a"), ("npm", "")])
 
     def test_files_that_are_not_code_install_nothing(self):
         self.write("package-lock.json", "{}")
@@ -1046,25 +1059,36 @@ class DepsPlanTest(unittest.TestCase):
     def test_only_the_ecosystem_of_the_changed_file(self):
         # A Python helper in a TypeScript repository installs Python only.
         self.write("package-lock.json", "{}")
-        self.write("pyproject.toml", "[project]\nname='x'\n")
+        self.write("requirements.txt", "requests==2.32.3\n")
         self.assertEqual(self.plan("scripts/tool.py"), [("pip", "")])
         self.assertEqual(self.plan("src/a.ts"), [("npm", "")])
 
-    def test_dotnet_restores_the_solution_next_to_the_project(self):
+    def test_dotnet_is_not_installed(self):
         self.write("App.sln")
         self.write("App.csproj")
         self.write("global.json", '{"sdk": {"version": "8.0.403"}}')
-        (step,) = checks.deps_plan(self.root, ["Program.cs"])
-        self.assertEqual(step["ecosystem"], "nuget")
-        self.assertEqual(step["command"], "dotnet restore 'App.sln'")
-        self.assertEqual(step["image"], "mcr.microsoft.com/dotnet/sdk:8.0")
-        self.assertEqual(step["env"]["NUGET_PACKAGES"], "/work/.checks-deps/nuget")
-        self.assertEqual(step["deps"], ".checks-deps/nuget")
+        steps = checks.deps_plan(self.root, ["Program.cs"])
+        self.assertFalse(any(step["action"] == "run" for step in steps))
+        self.assertEqual([(step["ecosystem"], step["status"]) for step in steps], [("nuget", "unsupported")])
+        text = checks.render_dependencies(self.rows(steps))
+        self.assertIn("NuGet is not installed", text)
+        self.assertIn("runs project code", text)
+        self.assertNotIn("dotnet", text)
+        self.assertNotIn("App.sln", text)
 
-    def test_dotnet_project_without_a_solution(self):
-        self.write("src/Lib/Lib.csproj")
-        (step,) = checks.deps_plan(self.root, ["src/Lib/Thing.cs"])
-        self.assertEqual((step["dir"], step["command"]), ("src/Lib", "dotnet restore 'Lib.csproj'"))
+    def test_java_does_not_schedule_maven_or_gradle(self):
+        self.write("pom.xml")
+        self.write("app/build.gradle")
+        steps = checks.deps_plan(self.root, ["app/src/A.java"])
+        self.assertFalse(any(step["action"] == "run" for step in steps))
+        self.assertEqual(
+            [(step["ecosystem"], step["status"]) for step in steps],
+            [("maven", "unsupported"), ("gradle", "unsupported")],
+        )
+        text = checks.render_dependencies(self.rows(steps))
+        self.assertIn("Maven and Gradle are not installed", text)
+        self.assertNotIn("mvn", text)
+        self.assertNotIn("gradlew", text)
 
     def test_other_ecosystems(self):
         self.write("go.mod", "module x\n\ngo 1.23.4\n")
@@ -1074,9 +1098,51 @@ class DepsPlanTest(unittest.TestCase):
         self.write("mod/pom.xml")
         plan = {s["ecosystem"]: s for s in checks.deps_plan(self.root, ["a.go", "src/lib.rs", "mod/src/A.java"])}
         self.assertEqual(plan["go"]["image"], "golang:1.23")
-        self.assertEqual(plan["cargo"]["command"], "cargo fetch")
-        # Maven builds from the outermost pom, the root of the reactor.
-        self.assertEqual(plan["maven"]["dir"], "")
+        self.assertEqual(plan["go"]["argv"], ["go", "mod", "download"])
+        self.assertEqual(plan["cargo"]["argv"], ["cargo", "fetch", "--locked"])
+        self.assertEqual(plan["maven"]["status"], "unsupported")
+        self.assertEqual(plan["gradle"]["status"], "unsupported")
+
+    def test_pip_installs_wheels_from_a_requirements_file(self):
+        self.write("a/requirements.txt", "requests==2.32.3\n")
+        self.write("b/requirements-dev.txt", "pytest==8.3.0\n")
+        steps = {step["dir"]: step for step in checks.deps_plan(self.root, ["a/x.py", "b/y.py"])}
+        self.assertEqual(
+            steps["a"]["argv"],
+            ["pip", "install", "--target", "/work/.checks-deps/python/a", "--only-binary", ":all:", "-r", "requirements.txt"],
+        )
+        self.assertEqual(steps["a"]["deps"], ".checks-deps/python/a")
+        self.assertEqual(steps["b"]["argv"][-1], "requirements-dev.txt")
+        self.assertEqual(steps["b"]["deps"], ".checks-deps/python/b")
+        self.assertNotIn(".", steps["a"]["argv"])
+
+    def test_pyproject_without_requirements_is_skipped(self):
+        self.write("pyproject.toml", "[project]\nname='x'\n")
+        steps = checks.deps_plan(self.root, ["a.py"])
+        self.assertEqual([(step["action"], step["reason"]) for step in steps], [("skip", "no-requirements")])
+        self.assertNotIn("pip install", json.dumps(steps))
+        text = checks.render_dependencies(self.rows(steps))
+        self.assertIn("no requirements file", text)
+        self.assertIn("would run project code", text)
+        self.assertNotIn("`pyproject.toml`", text)
+
+    def test_cargo_without_a_lockfile_is_skipped(self):
+        self.write("Cargo.toml", "[package]\nname='x'\nversion='0.1.0'\n")
+        steps = checks.deps_plan(self.root, ["src/lib.rs"])
+        self.assertEqual([(step["action"], step["reason"]) for step in steps], [("skip", "no-lock")])
+        self.assertNotIn("cargo fetch", json.dumps(steps))
+
+    def test_unsafe_project_paths_are_not_planned_or_shown(self):
+        self.write("package-lock.json", "{}")
+        steps = checks.deps_plan(self.root, ["bad'name/a.ts", "bad\nname/b.ts"])
+        blob = json.dumps(steps)
+        self.assertNotIn("bad'name", blob)
+        self.assertNotIn("bad\nname", blob)
+        self.assertTrue(steps)
+        self.assertTrue(all(step["reason"] == "unsafe-path" for step in steps))
+        text = checks.render_dependencies(self.rows(steps))
+        self.assertNotIn("bad", text)
+        self.assertIn("cannot be installed safely", text)
 
     def test_node_version_from_nvmrc_and_engines(self):
         self.write("a/package-lock.json", "{}")
@@ -1090,21 +1156,35 @@ class DepsPlanTest(unittest.TestCase):
         self.write("p/pnpm-lock.yaml")
         self.write("y/yarn.lock", "# yarn lockfile v1\n")
         self.write("z/yarn.lock", "__metadata:\n  version: 8\n")
-        commands = {s["dir"]: s["command"] for s in checks.deps_plan(self.root, ["p/a.ts", "y/a.ts", "z/a.ts"])}
-        self.assertIn("pnpm install --frozen-lockfile --ignore-scripts", commands["p"])
-        self.assertIn("--ignore-scripts", commands["y"])
-        self.assertIn("--mode=skip-build", commands["z"])
+        commands = {s["dir"]: s for s in checks.deps_plan(self.root, ["p/a.ts", "y/a.ts", "z/a.ts"])}
+        self.assertEqual(commands["p"]["prelude"], "corepack")
+        self.assertIn("--ignore-scripts", commands["p"]["argv"])
+        self.assertEqual(commands["y"]["prelude"], "corepack-yarn1")
+        self.assertIn("--ignore-scripts", commands["y"]["argv"])
+        self.assertNotIn("corepack prepare", commands["y"]["argv"])
+        self.assertEqual(commands["z"]["prelude"], "corepack")
+        self.assertIn("--mode=skip-build", commands["z"]["argv"])
 
     def test_dependencies_and_the_base_checkout_are_not_projects(self):
         self.write("package-lock.json", "{}")
         self.assertEqual(self.plan("node_modules/x/index.js", ".nextcli-checks-base/a.ts", ".checks-deps/go/x.go"), [])
 
-    def test_too_many_projects_are_capped(self):
+    def test_too_many_projects_are_capped_in_changed_file_order(self):
+        indexes = list(range(checks.MAX_PROJECTS_PER_ECOSYSTEM + 2))
         changed = []
-        for i in range(checks.MAX_PROJECTS_PER_ECOSYSTEM + 2):
+        for i in reversed(indexes):
             self.write(f"p{i}/package-lock.json", "{}")
             changed.append(f"p{i}/a.ts")
-        self.assertEqual(len(self.plan(*changed)), checks.MAX_PROJECTS_PER_ECOSYSTEM)
+        steps = checks.deps_plan(self.root, changed)
+        runs = [step["dir"] for step in steps if step["action"] == "run"]
+        capped = [step["dir"] for step in steps if step.get("reason") == "cap"]
+        discovered = [f"p{i}" for i in reversed(indexes)]
+        self.assertEqual(runs, discovered[: checks.MAX_PROJECTS_PER_ECOSYSTEM])
+        self.assertEqual(capped, discovered[checks.MAX_PROJECTS_PER_ECOSYSTEM :])
+        text = checks.render_dependencies(self.rows(steps))
+        self.assertIn("p1/node_modules", text)
+        self.assertIn("were not installed", text)
+        self.assertIn("p7/node_modules", text)
 
     def test_dependencies_section_in_the_prompt(self):
         none = checks.render_prompt("Check.", "diff")
@@ -1114,6 +1194,9 @@ class DepsPlanTest(unittest.TestCase):
         self.assertIn("- npm: `a/node_modules`", some)
         self.assertIn("could not be installed: nuget", some)
         self.assertNotIn("compiled", some)
+        hidden = checks.render_dependencies([("npm", "bad\nname/node_modules", "skipped", "cap")])
+        self.assertNotIn("bad", hidden)
+        self.assertIn("cannot be installed safely", hidden)
 
     def test_diff_comes_first_and_placeholders_in_it_stay_text(self):
         text = checks.render_prompt("CHECK BODY", "+ @@CHECK_BODY@@ in a diff")
@@ -1180,13 +1263,23 @@ class InstallDepsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         (run,) = [c for c in calls if c.startswith("run ")]
         self.assertIn("node:22", run)
-        self.assertIn("npm ci --ignore-scripts", run)
+        self.assertIn("--read-only", run)
+        self.assertIn("--cap-drop=ALL", run)
+        self.assertIn("--security-opt=no-new-privileges", run)
+        self.assertIn("--pids-limit=256", run)
+        self.assertIn(f"-v {self.workspace}:/work:ro", run)
+        self.assertIn(f"-v {self.workspace}/pkg/node_modules:/work/pkg/node_modules", run)
         self.assertIn("-w /work/pkg", run)
-        self.assertIn(f"-v {self.workspace}/.git:/work/.git:ro", run)
+        self.assertNotIn(".git:/work/.git", run)
+        script, command = run.split(" -c ", 1)[1].split(" -- ", 1)
+        self.assertIn("npm ci --ignore-scripts", command)
+        self.assertNotIn("a.ts", script)
+        self.assertNotIn("pkg", script)
+        self.assertNotIn("package-lock", script)
         self.assertNotIn("sk-secret-value", run)
         self.assertNotIn("PROVIDER_API_KEY", run)
         self.assertNotIn("docker.sock", run)
-        self.assertEqual(self.results.read_text(), "npm\tpkg/node_modules\tok\n")
+        self.assertEqual(self.results.read_text(), "npm\tpkg/node_modules\tok\t\n")
         self.assertEqual((self.workspace / ".checks-deps" / ".gitignore").read_text(), "*\n")
         self.assertIn("installed in", self.summary.read_text())
 
@@ -1194,7 +1287,20 @@ class InstallDepsTest(unittest.TestCase):
         result, _calls = self.run_install(docker_exit=1)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("::warning::Could not install npm", result.stdout)
-        self.assertEqual(self.results.read_text(), "npm\tpkg/node_modules\tfailed\n")
+        self.assertEqual(self.results.read_text(), "npm\tpkg/node_modules\tfailed\t\n")
+
+    def test_yarn_classic_prepares_yarn_1_without_putting_the_project_in_the_shell(self):
+        (self.workspace / "pkg" / "package-lock.json").unlink()
+        (self.workspace / "pkg" / "yarn.lock").write_text("# yarn lockfile v1\n")
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (run,) = [c for c in calls if c.startswith("run ")]
+        script, command = run.split(" -c ", 1)[1].split('exec "$@" -- ', 1)
+        self.assertIn("corepack prepare yarn@1.22.22 --activate", script)
+        self.assertIn("--ignore-scripts", command)
+        self.assertNotIn("a.ts", script)
+        self.assertNotIn("yarn.lock", script)
+        self.assertNotIn("pkg", script)
 
     def test_install_none_runs_nothing(self):
         result, calls = self.run_install(mode="none")

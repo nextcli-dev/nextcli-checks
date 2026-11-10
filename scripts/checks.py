@@ -224,59 +224,114 @@ def _node_image(root: Path, rel_dir: str) -> str:
     return "node:22"
 
 
-def _dotnet_image(root: Path, rel_dir: str) -> str:
-    for d in _ancestors(root, rel_dir):
-        path = (root / d if d else root) / "global.json"
-        if path.is_file():
-            try:
-                version = str(json.loads(path.read_text())["sdk"]["version"])
-            except (json.JSONDecodeError, KeyError, TypeError):
-                continue
-            match = re.match(r"(\d+\.\d+)", version)
-            if match:
-                return f"mcr.microsoft.com/dotnet/sdk:{match.group(1)}"
-    return "mcr.microsoft.com/dotnet/sdk:10.0"
-
-
 def _go_image(root: Path, rel_dir: str) -> str:
     go_mod = (root / rel_dir if rel_dir else root) / "go.mod"
     match = re.search(r"^go (\d+\.\d+)", go_mod.read_text(), re.M) if go_mod.is_file() else None
     return f"golang:{match.group(1)}" if match else "golang:1"
 
 
-# The JavaScript managers install into the project's own node_modules, which
-# is where Node looks and where the agent will look. Lifecycle scripts are off:
-# the dependencies are there to be read, not run.
-_COREPACK = (
-    "mkdir -p /tmp/home/bin && "
-    "{ corepack enable --install-directory /tmp/home/bin 2>/dev/null || "
-    "npx --yes corepack enable --install-directory /tmp/home/bin; } && "
-    "export PATH=/tmp/home/bin:$PATH && "
-)
+# A project directory may be mounted and printed. Empty is the repository root.
+_SAFE_REL = re.compile(r"^[A-Za-z0-9._/-]*$")
+_SAFE_REQUIREMENTS = re.compile(r"^requirements[A-Za-z0-9._-]*\.txt$")
+_JS_ENV = {
+    "npm_config_cache": "/cache/npm",
+    "YARN_CACHE_FOLDER": "/cache/yarn",
+    "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+}
+
+
+def _safe_rel(path: str) -> bool:
+    """A relative path with no '..', newline, or shell metacharacter."""
+    if path == ".":
+        path = ""
+    if path.startswith(("/", "\\")) or "\\" in path or "//" in path:
+        return False
+    if any(part == ".." for part in path.split("/")):
+        return False
+    return _SAFE_REL.fullmatch(path) is not None
+
+
+def _notice(ecosystem: str, directory: str, status: str, reason: str, deps: str = "") -> dict:
+    """A step that is not run. The path is kept only when it is safe to show."""
+    return {
+        "action": "skip",
+        "ecosystem": ecosystem,
+        "dir": directory if directory and _safe_rel(directory) else "",
+        "deps": deps if deps and _safe_rel(deps) else "",
+        "status": status,
+        "reason": reason,
+    }
+
+
+def _run(
+    ecosystem: str,
+    directory: str,
+    image: str,
+    argv: list[str],
+    env: dict[str, str],
+    deps: str,
+    prelude: str = "",
+    mount_node_modules: bool = False,
+) -> dict:
+    return {
+        "action": "run",
+        "ecosystem": ecosystem,
+        "dir": directory,
+        "image": image,
+        "argv": argv,
+        "prelude": prelude,
+        "env": env,
+        "deps": deps,
+        "mount_node_modules": mount_node_modules,
+        "status": "",
+        "reason": "",
+    }
 
 
 def _js_step(root: Path, rel_dir: str, lockfile: str) -> dict:
+    # argv is the package manager only. install-deps.sh adds a fixed corepack
+    # prelude when one is named; classic Yarn has to be activated explicitly
+    # because the node image does not ship a yarn binary.
+    if not _safe_rel(rel_dir):
+        manager = {"pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn"}.get(lockfile, "npm")
+        return _notice(manager, "", "skipped", "unsafe-path")
     if lockfile == "pnpm-lock.yaml":
-        manager, command = "pnpm", _COREPACK + "pnpm install --frozen-lockfile --ignore-scripts --store-dir /cache/pnpm"
+        manager, argv, prelude = (
+            "pnpm",
+            ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--store-dir", "/cache/pnpm"],
+            "corepack",
+        )
     elif lockfile == "yarn.lock":
         lock = (root / rel_dir / lockfile) if rel_dir else root / lockfile
         if "__metadata:" in lock.read_text(errors="replace")[:2000]:
-            manager, command = "yarn", _COREPACK + "yarn install --immutable --mode=skip-build"
+            manager, argv, prelude = (
+                "yarn",
+                ["yarn", "install", "--immutable", "--mode=skip-build"],
+                "corepack",
+            )
         else:
-            manager, command = "yarn", "yarn install --frozen-lockfile --ignore-scripts --non-interactive"
+            manager, argv, prelude = (
+                "yarn",
+                ["yarn", "install", "--frozen-lockfile", "--ignore-scripts", "--non-interactive"],
+                "corepack-yarn1",
+            )
     else:
-        manager, command = "npm", "npm ci --ignore-scripts --no-audit --no-fund"
-    return {
-        "ecosystem": manager,
-        "image": _node_image(root, rel_dir),
-        "command": command,
-        "env": {
-            "npm_config_cache": "/cache/npm",
-            "YARN_CACHE_FOLDER": "/cache/yarn",
-            "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
-        },
-        "deps": f"{rel_dir}/node_modules" if rel_dir else "node_modules",
-    }
+        manager, argv, prelude = (
+            "npm",
+            ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+            "",
+        )
+    deps = f"{rel_dir}/node_modules" if rel_dir else "node_modules"
+    return _run(
+        manager,
+        rel_dir,
+        _node_image(root, rel_dir),
+        argv,
+        _JS_ENV,
+        deps,
+        prelude=prelude,
+        mount_node_modules=True,
+    )
 
 
 def _nearest(root: Path, rel_dir: str, names: tuple[str, ...]) -> tuple[str, str] | None:
@@ -287,13 +342,29 @@ def _nearest(root: Path, rel_dir: str, names: tuple[str, ...]) -> tuple[str, str
     return None
 
 
-def _outermost(root: Path, rel_dir: str, names: tuple[str, ...]) -> tuple[str, str] | None:
-    found = None
+def _python_dir(root: Path, rel_dir: str) -> str | None:
     for d in _ancestors(root, rel_dir):
-        name = _has(root, d, *names)
-        if name:
-            found = (d, name)
-    return found
+        if _has(root, d, "pyproject.toml", "setup.py", "setup.cfg"):
+            return d
+        base = root / d if d else root
+        if any(
+            path.is_file() and _SAFE_REQUIREMENTS.fullmatch(path.name)
+            for path in base.glob("requirements*.txt")
+        ):
+            return d
+    return None
+
+
+def _requirements_name(root: Path, rel_dir: str) -> str | None:
+    base = root / rel_dir if rel_dir else root
+    names = sorted(
+        path.name
+        for path in base.glob("requirements*.txt")
+        if path.is_file() and _SAFE_REQUIREMENTS.fullmatch(path.name)
+    )
+    if "requirements.txt" in names:
+        return "requirements.txt"
+    return names[0] if names else None
 
 
 # A changed file only asks for the ecosystems its kind of file belongs to, so
@@ -312,103 +383,96 @@ def file_ecosystems(path: str) -> set[str]:
     return {kind for kind, pattern in _ECOSYSTEM_FILES.items() if pattern.search(path)}
 
 
+def _pip_step(root: Path, rel_dir: str) -> dict | None:
+    directory = _python_dir(root, rel_dir)
+    if directory is None:
+        return None
+    if not _safe_rel(directory):
+        return _notice("pip", "", "skipped", "unsafe-path")
+    requirements = _requirements_name(root, directory)
+    if requirements is None:
+        # pyproject.toml and setup.py would run project code.
+        return _notice("pip", "", "skipped", "no-requirements")
+    target = f"{DEPS_DIR}/python/{directory or 'root'}"
+    return _run(
+        "pip",
+        directory,
+        "python:3.13",
+        ["pip", "install", "--target", f"/work/{target}", "--only-binary", ":all:", "-r", requirements],
+        {
+            "PIP_CACHE_DIR": "/cache/pip",
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_NO_INPUT": "1",
+        },
+        target,
+    )
+
+
+def _go_step(root: Path, rel_dir: str) -> dict | None:
+    found = _nearest(root, rel_dir, ("go.mod",))
+    if not found:
+        return None
+    directory = found[0]
+    if not _safe_rel(directory):
+        return _notice("go", "", "skipped", "unsafe-path")
+    return _run(
+        "go",
+        directory,
+        _go_image(root, directory),
+        ["go", "mod", "download"],
+        {
+            "GOMODCACHE": f"/work/{DEPS_DIR}/go",
+            "GOFLAGS": "-modcacherw",
+            "GOCACHE": "/tmp/home/gocache",
+            "GOPATH": "/tmp/home/go",
+        },
+        f"{DEPS_DIR}/go",
+    )
+
+
+def _cargo_step(root: Path, rel_dir: str) -> dict | None:
+    lock = _nearest(root, rel_dir, ("Cargo.lock",))
+    if lock:
+        if not _safe_rel(lock[0]):
+            return _notice("cargo", "", "skipped", "unsafe-path")
+        return _run(
+            "cargo",
+            lock[0],
+            "rust:1",
+            ["cargo", "fetch", "--locked"],
+            {"CARGO_HOME": f"/work/{DEPS_DIR}/cargo"},
+            f"{DEPS_DIR}/cargo/registry/src",
+        )
+    if _nearest(root, rel_dir, ("Cargo.toml",)):
+        # fetch without a lockfile writes Cargo.lock into the project.
+        return _notice("cargo", "", "skipped", "no-lock")
+    return None
+
+
 def _steps_for(root: Path, rel_dir: str, kinds: set[str]) -> list[dict]:
     """The install steps for the projects that contain rel_dir, for the given
-    kinds of file."""
+    kinds of file. NuGet, Maven, and Gradle are notices: restoring them runs
+    project code."""
     steps: list[dict] = []
-    js = "js" in kinds and _nearest(root, rel_dir, ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock"))
-    if js:
-        steps.append({"dir": js[0], **_js_step(root, js[0], js[1])})
-
-    dotnet = "nuget" in kinds and _nearest(root, rel_dir, ("*.sln", "*.slnx", "*.csproj", "*.fsproj", "*.vbproj"))
-    if dotnet:
-        # A solution restores every project in it; otherwise restore the
-        # nearest project, which brings its project references along.
-        target = _has(root, dotnet[0], "*.sln", "*.slnx") or dotnet[1]
-        steps.append({
-            "dir": dotnet[0],
-            "ecosystem": "nuget",
-            "image": _dotnet_image(root, dotnet[0]),
-            "command": f"dotnet restore '{target}'",
-            "env": {
-                "NUGET_PACKAGES": f"/work/{DEPS_DIR}/nuget",
-                "NUGET_HTTP_CACHE_PATH": "/cache/nuget-http",
-                "DOTNET_CLI_HOME": "/tmp/home",
-                "DOTNET_NOLOGO": "1",
-                "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
-                "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1",
-            },
-            "deps": f"{DEPS_DIR}/nuget",
-        })
-
-    python = "pip" in kinds and _nearest(root, rel_dir, ("requirements.txt", "pyproject.toml", "setup.py", "setup.cfg"))
-    if python:
-        source = "-r requirements.txt" if _has(root, python[0], "requirements.txt") else "."
-        steps.append({
-            "dir": python[0],
-            "ecosystem": "pip",
-            "image": "python:3.13",
-            "command": f"pip install --target /work/{DEPS_DIR}/python {source}",
-            "env": {
-                "PIP_CACHE_DIR": "/cache/pip",
-                "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-                "PIP_NO_INPUT": "1",
-            },
-            "deps": f"{DEPS_DIR}/python",
-        })
-
-    go = "go" in kinds and _nearest(root, rel_dir, ("go.mod",))
-    if go:
-        steps.append({
-            "dir": go[0],
-            "ecosystem": "go",
-            "image": _go_image(root, go[0]),
-            "command": "go mod download",
-            "env": {
-                "GOMODCACHE": f"/work/{DEPS_DIR}/go",
-                "GOFLAGS": "-modcacherw",
-                "GOCACHE": "/tmp/home/gocache",
-                "GOPATH": "/tmp/home/go",
-            },
-            "deps": f"{DEPS_DIR}/go",
-        })
-
-    cargo = "cargo" in kinds and (_nearest(root, rel_dir, ("Cargo.lock",)) or _nearest(root, rel_dir, ("Cargo.toml",)))
-    if cargo:
-        steps.append({
-            "dir": cargo[0],
-            "ecosystem": "cargo",
-            "image": "rust:1",
-            "command": "cargo fetch",
-            "env": {"CARGO_HOME": f"/work/{DEPS_DIR}/cargo"},
-            "deps": f"{DEPS_DIR}/cargo/registry/src",
-        })
-
-    # Maven and Gradle build from the root of a multi-module build.
-    maven = "jvm" in kinds and _outermost(root, rel_dir, ("pom.xml",))
-    if maven:
-        steps.append({
-            "dir": maven[0],
-            "ecosystem": "maven",
-            "image": "maven:3-eclipse-temurin-21",
-            "command": f"mvn -B -q dependency:go-offline -Dmaven.repo.local=/work/{DEPS_DIR}/maven -Duser.home=/tmp/home",
-            "env": {"MAVEN_CONFIG": "/tmp/home/.m2"},
-            "deps": f"{DEPS_DIR}/maven",
-        })
-    gradle = "jvm" in kinds and (
-        _outermost(root, rel_dir, ("settings.gradle", "settings.gradle.kts"))
-        or _nearest(root, rel_dir, ("build.gradle", "build.gradle.kts"))
+    js = "js" in kinds and _nearest(
+        root, rel_dir, ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock")
     )
-    if gradle:
-        runner = "./gradlew" if _has(root, gradle[0], "gradlew") else "gradle"
-        steps.append({
-            "dir": gradle[0],
-            "ecosystem": "gradle",
-            "image": "gradle:jdk21",
-            "command": f"{runner} --no-daemon -q dependencies",
-            "env": {"GRADLE_USER_HOME": f"/work/{DEPS_DIR}/gradle"},
-            "deps": f"{DEPS_DIR}/gradle",
-        })
+    if js:
+        steps.append(_js_step(root, js[0], js[1]))
+    pip = _pip_step(root, rel_dir) if "pip" in kinds else None
+    if pip:
+        steps.append(pip)
+    go = _go_step(root, rel_dir) if "go" in kinds else None
+    if go:
+        steps.append(go)
+    cargo = _cargo_step(root, rel_dir) if "cargo" in kinds else None
+    if cargo:
+        steps.append(cargo)
+    if "nuget" in kinds:
+        steps.append(_notice("nuget", "", "unsupported", "no-exec"))
+    if "jvm" in kinds:
+        steps.append(_notice("maven", "", "unsupported", "no-exec"))
+        steps.append(_notice("gradle", "", "unsupported", "no-exec"))
     return steps
 
 
@@ -418,66 +482,134 @@ MAX_PROJECTS_PER_ECOSYSTEM = 6
 
 
 def deps_plan(root: Path, changed: list[str]) -> list[dict]:
-    """One install step per (ecosystem, project directory) that holds a
-    changed file, nearest project first, in a stable order."""
-    seen: dict[tuple[str, str], dict] = {}
+    """Install steps for the changed files, in the order those files name
+    their projects. Past six projects in one ecosystem, the rest are skips."""
+    runs: dict[tuple[str, str], dict] = {}
+    notices: dict[tuple[str, str, str], dict] = {}
     for path in changed:
         path = path.strip()
         if not path or any(part in _NOT_A_PROJECT for part in path.split("/")):
+            continue
+        if not _safe_rel(path):
+            notices.setdefault(("project", "", "unsafe-path"), _notice("project", "", "skipped", "unsafe-path"))
             continue
         kinds = file_ecosystems(path)
         if not kinds:
             continue
         for step in _steps_for(root, os.path.dirname(path), kinds):
-            seen.setdefault((step["ecosystem"], step["dir"]), step)
+            if step["action"] == "run":
+                runs.setdefault((step["ecosystem"], step["dir"]), step)
+            else:
+                notices.setdefault((step["ecosystem"], step["dir"], step["reason"]), step)
     plan: list[dict] = []
     per_ecosystem: dict[str, int] = {}
-    for (ecosystem, _dir), step in sorted(seen.items()):
+    for step in runs.values():
+        ecosystem = step["ecosystem"]
         per_ecosystem[ecosystem] = per_ecosystem.get(ecosystem, 0) + 1
         if per_ecosystem[ecosystem] <= MAX_PROJECTS_PER_ECOSYSTEM:
             plan.append(step)
+        else:
+            plan.append(_notice(ecosystem, step["dir"], "skipped", "cap", step["deps"]))
+    plan.extend(notices.values())
     return plan
 
 
-def render_dependencies(results: list[tuple[str, str, str]]) -> str:
+_UNSUPPORTED_NAMES = {"nuget": "NuGet", "maven": "Maven", "gradle": "Gradle"}
+
+
+def _shown_location(loc: str) -> str | None:
+    if loc and _safe_rel(loc):
+        return loc
+    return None
+
+
+def _english_join(names: list[str]) -> str:
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return ", ".join(names[:-1]) + f" and {names[-1]}"
+
+
+def _listed(prefix: str, items: list[tuple[str, str | None]]) -> str:
+    parts = [f"{ecosystem} (`{loc}`)" if loc else ecosystem for ecosystem, loc in items]
+    return prefix + ", ".join(parts) + ". Judge those libraries from how the repository uses them."
+
+
+def render_dependencies(results: list[tuple]) -> str:
     """The prompt's Dependencies section, from install-deps.sh's
-    (ecosystem, location, status) lines."""
-    installed = [(e, loc) for e, loc, status in results if status == "ok"]
-    failed = [(e, loc) for e, loc, status in results if status != "ok"]
+    (ecosystem, location, status, reason) lines."""
+    installed: list[tuple[str, str]] = []
+    failed: list[tuple[str, str | None]] = []
+    skipped: list[tuple[str, str | None]] = []
+    reasons: set[str] = set()
+    unsupported: list[str] = []
+    for row in results:
+        ecosystem, loc, status = row[0], row[1], row[2]
+        reason = row[3] if len(row) > 3 else ""
+        shown = _shown_location(loc)
+        if status == "ok" and shown:
+            installed.append((ecosystem, shown))
+        elif status == "failed":
+            failed.append((ecosystem, shown))
+        elif status == "unsupported":
+            if ecosystem not in unsupported:
+                unsupported.append(ecosystem)
+        elif status == "skipped":
+            if reason in ("no-lock", "no-requirements", "unsafe-path"):
+                reasons.add(reason)
+            elif shown:
+                skipped.append((ecosystem, shown))
+            else:
+                reasons.add("unsafe-path")
     lines: list[str] = []
     if installed:
         lines.append("The pull request's dependencies are installed inside the repository:")
-        lines.extend(f"- {e}: `{loc}`" for e, loc in installed)
-        lines.append("Read a library there when you need its behavior or types.")
-        if any(e in ("nuget", "maven", "gradle") for e, _loc in installed):
-            lines.append(
-                "NuGet, Maven and Gradle packages are compiled: their API is in the documentation and metadata files next to the binaries."
-            )
-    if failed:
+        lines.extend(f"- {ecosystem}: `{loc}`" for ecosystem, loc in installed)
         lines.append(
-            "These could not be installed: "
-            + ", ".join(f"{e} (`{loc}`)" for e, loc in failed)
-            + ". Judge those libraries from how the repository uses them."
+            "Read a library there when you need its behavior or types. "
+            "Search skips these directories; they are gitignored."
+        )
+    if failed:
+        lines.append(_listed("These could not be installed: ", failed))
+    if skipped:
+        lines.append(_listed("These were not installed: ", skipped))
+    if "no-lock" in reasons:
+        lines.append(
+            "Cargo was not installed because the project has no Cargo.lock. "
+            "Judge it from how the repository uses it."
+        )
+    if "no-requirements" in reasons:
+        lines.append(
+            "pip was not installed because the project has no requirements file. "
+            "Installing from pyproject.toml or setup.py would run project code."
+        )
+    if "unsafe-path" in reasons:
+        lines.append("A project was skipped because its path cannot be installed safely.")
+    names = [_UNSUPPORTED_NAMES[eco] for eco in ("nuget", "maven", "gradle") if eco in unsupported]
+    if names:
+        verb = "is" if len(names) == 1 else "are"
+        pronoun = "it" if len(names) == 1 else "them"
+        lines.append(
+            f"{_english_join(names)} {verb} not installed: restoring {pronoun} runs project code. "
+            "Judge those libraries from how the repository uses them."
         )
     if not lines:
-        lines.append(
-            "Dependencies are not installed. Judge a library from how the repository uses it."
-        )
-    lines.append(
-        "Read only paths inside the repository. Do not look for packages in caches or system folders."
-    )
+        lines.append("Dependencies are not installed. Judge a library from how the repository uses it.")
+    lines.append("Read only paths inside the repository. Do not look for packages in caches or system folders.")
     return "\n".join(lines)
 
 
-def read_dependency_results(path: str) -> list[tuple[str, str, str]]:
+def read_dependency_results(path: str) -> list[tuple[str, str, str, str]]:
     results = []
     file = Path(path)
     if not file.is_file():
         return results
     for line in file.read_text().splitlines():
         parts = line.split("\t")
-        if len(parts) == 3:
-            results.append((parts[0], parts[1], parts[2]))
+        if len(parts) >= 3:
+            reason = parts[3] if len(parts) > 3 else ""
+            results.append((parts[0], parts[1], parts[2], reason))
     return results
 
 
@@ -894,7 +1026,11 @@ def check_run_body(verdict: dict, conclusion: str, details_url: str, repo: str =
     return body
 
 
-def conclusion_for(verdict: str, on_error: str) -> str:
+def conclusion_for(verdict: str, on_error: str, complete: bool = True) -> str:
+    # A partial pass found nothing before its limit. The comment still shows
+    # it; the check run does not count as success.
+    if verdict == "PASS" and complete is False:
+        return "neutral"
     if verdict == "PASS" or verdict == "SKIP":
         return "success"
     if verdict == "FAIL":
@@ -1072,16 +1208,14 @@ def cmd_limit_message(args: argparse.Namespace) -> int:
 
 
 def cmd_deps_plan(args: argparse.Namespace) -> int:
-    """Print one tab-separated install step per line: ecosystem, project
-    directory, image, dependency location, environment (KEY=VALUE, space
-    separated), command."""
+    """Print one JSON object per line. A run step has argv; a skip step has
+    status and reason. Paths are relative and contain no shell metacharacters."""
     try:
         changed = Path(args.changed).read_text().splitlines()
     except OSError:
         changed = []
     for step in deps_plan(Path(args.root), changed):
-        env = " ".join(f"{k}={v}" for k, v in step["env"].items())
-        print("\t".join([step["ecosystem"], step["dir"] or ".", step["image"], step["deps"], env, step["command"]]))
+        print(json.dumps(step, separators=(",", ":")))
     return 0
 
 

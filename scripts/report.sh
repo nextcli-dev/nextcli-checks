@@ -12,12 +12,13 @@ check_run_id="${3:-}"
 
 verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$verdict_file")"
 summary="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("summary") or "")' "$verdict_file")"
+complete="$(python3 -c 'import json,sys; print("false" if json.load(open(sys.argv[1])).get("complete") is False else "true")' "$verdict_file")"
 on_error="${CHECKS_ON_ERROR:-neutral}"
 case "$on_error" in
   neutral|failure) ;;
   *) on_error="neutral" ;;
 esac
-conclusion="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import checks; print(checks.conclusion_for(sys.argv[2], sys.argv[3]))' "$script_dir" "$verdict" "$on_error")"
+conclusion="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import checks; print(checks.conclusion_for(sys.argv[2], sys.argv[3], sys.argv[4] != "false"))' "$script_dir" "$verdict" "$on_error" "$complete")"
 
 details_url=""
 if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${PR_NUMBER:-}" ]; then
