@@ -19,9 +19,10 @@
 # Set `checks: anti-slop,review` to run only those checks, for example from a
 # repository variable, to control what a pull request costs.
 #
-# The jobs below use the action in this repository at the same commit as this
-# workflow. Release this file and the action together, and move the v3 tag
-# for both.
+# The jobs below use `$/`, the action at the root of this repository at the
+# same commit as this workflow. That still resolves here when another
+# repository calls the workflow, and it does not need a checkout. Release
+# this file and the action together, and move the v3 tag for both.
 name: AI Checks
 
 on:
@@ -118,7 +119,7 @@ jobs:
       - name: List checks
         id: list
         if: steps.config.outputs.enabled == 'true'
-        uses: ./
+        uses: $/
         with:
           mode: list
           pr-number: ${{ inputs.pr-number }}
@@ -166,7 +167,7 @@ jobs:
       matrix:
         check: ${{ fromJson(needs.discover.outputs.checks) }}
     steps:
-      - uses: ./
+      - uses: $/
         with:
           mode: run
           check: ${{ matrix.check }}
@@ -203,7 +204,7 @@ jobs:
           path: ${{ runner.temp }}/check-results
           merge-multiple: true
 
-      - uses: ./
+      - uses: $/
         with:
           mode: comment
           pr-number: ${{ inputs.pr-number }}
