@@ -144,10 +144,20 @@ def yaml_quote(value: str) -> str:
 
 
 def render_prompt(
-    check_body: str, diff: str, retry: bool = False, empty_review: bool = False
+    check_body: str,
+    diff: str,
+    retry: bool = False,
+    empty_review: bool = False,
+    dependencies: str = "",
 ) -> str:
     template = (SCRIPT_DIR / "prompt.md").read_text()
-    text = template.replace("@@CHECK_BODY@@", check_body).replace("@@PR_DIFF@@", diff)
+    values = {
+        "PR_DIFF": diff,
+        "DEPENDENCIES": dependencies or render_dependencies([]),
+        "CHECK_BODY": check_body,
+    }
+    # One pass, so a placeholder written inside the diff is left as text.
+    text = re.sub(r"@@(PR_DIFF|DEPENDENCIES|CHECK_BODY)@@", lambda m: values[m.group(1)], template)
     if empty_review:
         text += (
             "\n\nYour previous response did not review the diff in this prompt. "
@@ -160,6 +170,315 @@ def render_prompt(
             "Reply with only the JSON object, with no markdown fences and no other text.\n"
         )
     return text
+
+
+# Where install-deps.sh puts the dependencies of ecosystems whose packages
+# would otherwise land outside the repository. It is inside the workspace, so
+# the agent may read it, and holds a .gitignore of "*", so Search skips it.
+DEPS_DIR = ".checks-deps"
+
+# Paths that are never a project to install: dependencies and the checks'
+# own base checkout.
+_NOT_A_PROJECT = ("node_modules", DEPS_DIR, ".nextcli-checks-base", ".git")
+
+
+def _ancestors(root: Path, rel_dir: str) -> list[str]:
+    """rel_dir and each of its parents up to the root ("" is the root)."""
+    parts = [p for p in rel_dir.split("/") if p and p != "."]
+    return ["/".join(parts[:i]) for i in range(len(parts), -1, -1)]
+
+
+def _has(root: Path, rel_dir: str, *names: str) -> str | None:
+    base = root / rel_dir if rel_dir else root
+    for name in names:
+        if "*" in name:
+            found = sorted(base.glob(name))
+            if found:
+                return found[0].name
+        elif (base / name).is_file():
+            return name
+    return None
+
+
+def _major_version(text: str) -> str | None:
+    match = re.search(r"(\d+)", text)
+    return match.group(1) if match else None
+
+
+def _node_image(root: Path, rel_dir: str) -> str:
+    for d in _ancestors(root, rel_dir):
+        base = root / d if d else root
+        for name in (".nvmrc", ".node-version"):
+            if (base / name).is_file():
+                major = _major_version((base / name).read_text())
+                if major:
+                    return f"node:{major}"
+        if (base / "package.json").is_file():
+            try:
+                engines = json.loads((base / "package.json").read_text()).get("engines") or {}
+            except (json.JSONDecodeError, AttributeError):
+                engines = {}
+            major = _major_version(str(engines.get("node") or ""))
+            if major:
+                return f"node:{major}"
+    return "node:22"
+
+
+def _dotnet_image(root: Path, rel_dir: str) -> str:
+    for d in _ancestors(root, rel_dir):
+        path = (root / d if d else root) / "global.json"
+        if path.is_file():
+            try:
+                version = str(json.loads(path.read_text())["sdk"]["version"])
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+            match = re.match(r"(\d+\.\d+)", version)
+            if match:
+                return f"mcr.microsoft.com/dotnet/sdk:{match.group(1)}"
+    return "mcr.microsoft.com/dotnet/sdk:10.0"
+
+
+def _go_image(root: Path, rel_dir: str) -> str:
+    go_mod = (root / rel_dir if rel_dir else root) / "go.mod"
+    match = re.search(r"^go (\d+\.\d+)", go_mod.read_text(), re.M) if go_mod.is_file() else None
+    return f"golang:{match.group(1)}" if match else "golang:1"
+
+
+# The JavaScript managers install into the project's own node_modules, which
+# is where Node looks and where the agent will look. Lifecycle scripts are off:
+# the dependencies are there to be read, not run.
+_COREPACK = (
+    "mkdir -p /tmp/home/bin && "
+    "{ corepack enable --install-directory /tmp/home/bin 2>/dev/null || "
+    "npx --yes corepack enable --install-directory /tmp/home/bin; } && "
+    "export PATH=/tmp/home/bin:$PATH && "
+)
+
+
+def _js_step(root: Path, rel_dir: str, lockfile: str) -> dict:
+    if lockfile == "pnpm-lock.yaml":
+        manager, command = "pnpm", _COREPACK + "pnpm install --frozen-lockfile --ignore-scripts --store-dir /cache/pnpm"
+    elif lockfile == "yarn.lock":
+        lock = (root / rel_dir / lockfile) if rel_dir else root / lockfile
+        if "__metadata:" in lock.read_text(errors="replace")[:2000]:
+            manager, command = "yarn", _COREPACK + "yarn install --immutable --mode=skip-build"
+        else:
+            manager, command = "yarn", "yarn install --frozen-lockfile --ignore-scripts --non-interactive"
+    else:
+        manager, command = "npm", "npm ci --ignore-scripts --no-audit --no-fund"
+    return {
+        "ecosystem": manager,
+        "image": _node_image(root, rel_dir),
+        "command": command,
+        "env": {
+            "npm_config_cache": "/cache/npm",
+            "YARN_CACHE_FOLDER": "/cache/yarn",
+            "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+        },
+        "deps": f"{rel_dir}/node_modules" if rel_dir else "node_modules",
+    }
+
+
+def _nearest(root: Path, rel_dir: str, names: tuple[str, ...]) -> tuple[str, str] | None:
+    for d in _ancestors(root, rel_dir):
+        found = _has(root, d, *names)
+        if found:
+            return d, found
+    return None
+
+
+def _outermost(root: Path, rel_dir: str, names: tuple[str, ...]) -> tuple[str, str] | None:
+    found = None
+    for d in _ancestors(root, rel_dir):
+        name = _has(root, d, *names)
+        if name:
+            found = (d, name)
+    return found
+
+
+# A changed file only asks for the ecosystems its kind of file belongs to, so
+# a README or a Python helper in a TypeScript repository installs nothing extra.
+_ECOSYSTEM_FILES = {
+    "js": re.compile(r"\.(?:[cm]?[jt]sx?|vue|svelte|astro)$|(?:^|/)(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|tsconfig[^/]*\.json)$"),
+    "nuget": re.compile(r"\.(?:cs|fs|fsx|vb|razor|cshtml|xaml|csproj|fsproj|vbproj|sln|slnx|props|targets)$|(?:^|/)(?:packages\.lock\.json|global\.json|nuget\.config)$", re.I),
+    "pip": re.compile(r"\.pyi?$|(?:^|/)(?:requirements[^/]*\.txt|pyproject\.toml|setup\.py|setup\.cfg)$"),
+    "go": re.compile(r"\.go$|(?:^|/)go\.(?:mod|sum)$"),
+    "cargo": re.compile(r"\.rs$|(?:^|/)Cargo\.(?:toml|lock)$"),
+    "jvm": re.compile(r"\.(?:java|kt|kts|scala|groovy)$|(?:^|/)(?:pom\.xml|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|gradle\.properties)$"),
+}
+
+
+def file_ecosystems(path: str) -> set[str]:
+    return {kind for kind, pattern in _ECOSYSTEM_FILES.items() if pattern.search(path)}
+
+
+def _steps_for(root: Path, rel_dir: str, kinds: set[str]) -> list[dict]:
+    """The install steps for the projects that contain rel_dir, for the given
+    kinds of file."""
+    steps: list[dict] = []
+    js = "js" in kinds and _nearest(root, rel_dir, ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock"))
+    if js:
+        steps.append({"dir": js[0], **_js_step(root, js[0], js[1])})
+
+    dotnet = "nuget" in kinds and _nearest(root, rel_dir, ("*.sln", "*.slnx", "*.csproj", "*.fsproj", "*.vbproj"))
+    if dotnet:
+        # A solution restores every project in it; otherwise restore the
+        # nearest project, which brings its project references along.
+        target = _has(root, dotnet[0], "*.sln", "*.slnx") or dotnet[1]
+        steps.append({
+            "dir": dotnet[0],
+            "ecosystem": "nuget",
+            "image": _dotnet_image(root, dotnet[0]),
+            "command": f"dotnet restore '{target}'",
+            "env": {
+                "NUGET_PACKAGES": f"/work/{DEPS_DIR}/nuget",
+                "NUGET_HTTP_CACHE_PATH": "/cache/nuget-http",
+                "DOTNET_CLI_HOME": "/tmp/home",
+                "DOTNET_NOLOGO": "1",
+                "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+                "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1",
+            },
+            "deps": f"{DEPS_DIR}/nuget",
+        })
+
+    python = "pip" in kinds and _nearest(root, rel_dir, ("requirements.txt", "pyproject.toml", "setup.py", "setup.cfg"))
+    if python:
+        source = "-r requirements.txt" if _has(root, python[0], "requirements.txt") else "."
+        steps.append({
+            "dir": python[0],
+            "ecosystem": "pip",
+            "image": "python:3.13",
+            "command": f"pip install --target /work/{DEPS_DIR}/python {source}",
+            "env": {
+                "PIP_CACHE_DIR": "/cache/pip",
+                "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                "PIP_NO_INPUT": "1",
+            },
+            "deps": f"{DEPS_DIR}/python",
+        })
+
+    go = "go" in kinds and _nearest(root, rel_dir, ("go.mod",))
+    if go:
+        steps.append({
+            "dir": go[0],
+            "ecosystem": "go",
+            "image": _go_image(root, go[0]),
+            "command": "go mod download",
+            "env": {
+                "GOMODCACHE": f"/work/{DEPS_DIR}/go",
+                "GOFLAGS": "-modcacherw",
+                "GOCACHE": "/tmp/home/gocache",
+                "GOPATH": "/tmp/home/go",
+            },
+            "deps": f"{DEPS_DIR}/go",
+        })
+
+    cargo = "cargo" in kinds and (_nearest(root, rel_dir, ("Cargo.lock",)) or _nearest(root, rel_dir, ("Cargo.toml",)))
+    if cargo:
+        steps.append({
+            "dir": cargo[0],
+            "ecosystem": "cargo",
+            "image": "rust:1",
+            "command": "cargo fetch",
+            "env": {"CARGO_HOME": f"/work/{DEPS_DIR}/cargo"},
+            "deps": f"{DEPS_DIR}/cargo/registry/src",
+        })
+
+    # Maven and Gradle build from the root of a multi-module build.
+    maven = "jvm" in kinds and _outermost(root, rel_dir, ("pom.xml",))
+    if maven:
+        steps.append({
+            "dir": maven[0],
+            "ecosystem": "maven",
+            "image": "maven:3-eclipse-temurin-21",
+            "command": f"mvn -B -q dependency:go-offline -Dmaven.repo.local=/work/{DEPS_DIR}/maven -Duser.home=/tmp/home",
+            "env": {"MAVEN_CONFIG": "/tmp/home/.m2"},
+            "deps": f"{DEPS_DIR}/maven",
+        })
+    gradle = "jvm" in kinds and (
+        _outermost(root, rel_dir, ("settings.gradle", "settings.gradle.kts"))
+        or _nearest(root, rel_dir, ("build.gradle", "build.gradle.kts"))
+    )
+    if gradle:
+        runner = "./gradlew" if _has(root, gradle[0], "gradlew") else "gradle"
+        steps.append({
+            "dir": gradle[0],
+            "ecosystem": "gradle",
+            "image": "gradle:jdk21",
+            "command": f"{runner} --no-daemon -q dependencies",
+            "env": {"GRADLE_USER_HOME": f"/work/{DEPS_DIR}/gradle"},
+            "deps": f"{DEPS_DIR}/gradle",
+        })
+    return steps
+
+
+# More projects than this per ecosystem is a sweeping change; installing them
+# all would take longer than the check.
+MAX_PROJECTS_PER_ECOSYSTEM = 6
+
+
+def deps_plan(root: Path, changed: list[str]) -> list[dict]:
+    """One install step per (ecosystem, project directory) that holds a
+    changed file, nearest project first, in a stable order."""
+    seen: dict[tuple[str, str], dict] = {}
+    for path in changed:
+        path = path.strip()
+        if not path or any(part in _NOT_A_PROJECT for part in path.split("/")):
+            continue
+        kinds = file_ecosystems(path)
+        if not kinds:
+            continue
+        for step in _steps_for(root, os.path.dirname(path), kinds):
+            seen.setdefault((step["ecosystem"], step["dir"]), step)
+    plan: list[dict] = []
+    per_ecosystem: dict[str, int] = {}
+    for (ecosystem, _dir), step in sorted(seen.items()):
+        per_ecosystem[ecosystem] = per_ecosystem.get(ecosystem, 0) + 1
+        if per_ecosystem[ecosystem] <= MAX_PROJECTS_PER_ECOSYSTEM:
+            plan.append(step)
+    return plan
+
+
+def render_dependencies(results: list[tuple[str, str, str]]) -> str:
+    """The prompt's Dependencies section, from install-deps.sh's
+    (ecosystem, location, status) lines."""
+    installed = [(e, loc) for e, loc, status in results if status == "ok"]
+    failed = [(e, loc) for e, loc, status in results if status != "ok"]
+    lines: list[str] = []
+    if installed:
+        lines.append("The pull request's dependencies are installed inside the repository:")
+        lines.extend(f"- {e}: `{loc}`" for e, loc in installed)
+        lines.append("Read a library there when you need its behavior or types.")
+        if any(e in ("nuget", "maven", "gradle") for e, _loc in installed):
+            lines.append(
+                "NuGet, Maven and Gradle packages are compiled: their API is in the documentation and metadata files next to the binaries."
+            )
+    if failed:
+        lines.append(
+            "These could not be installed: "
+            + ", ".join(f"{e} (`{loc}`)" for e, loc in failed)
+            + ". Judge those libraries from how the repository uses them."
+        )
+    if not lines:
+        lines.append(
+            "Dependencies are not installed. Judge a library from how the repository uses it."
+        )
+    lines.append(
+        "Read only paths inside the repository. Do not look for packages in caches or system folders."
+    )
+    return "\n".join(lines)
+
+
+def read_dependency_results(path: str) -> list[tuple[str, str, str]]:
+    results = []
+    file = Path(path)
+    if not file.is_file():
+        return results
+    for line in file.read_text().splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            results.append((parts[0], parts[1], parts[2]))
+    return results
 
 
 def reviewed_nothing(verdict: dict, diff: str) -> bool:
@@ -483,7 +802,7 @@ def partial_note(verdict: dict) -> str:
     if verdict.get("limit") == "cost":
         why = "It reached its cost limit before it finished"
     elif verdict.get("limit") in ("turns", "tokens"):
-        why = f"It reached its {verdict['limit']} limit before it finished"
+        why = f"It reached its {verdict['limit'].rstrip('s')} limit before it finished"
     else:
         why = "The agent did not finish"
     return f"> **Partial review.** {why}. The findings cover only what it checked.\n"
@@ -717,9 +1036,52 @@ def cmd_render_prompt(args: argparse.Namespace) -> int:
     text = Path(args.check).read_text()
     _frontmatter, body = parse_frontmatter(text)
     diff = Path(args.diff).read_text() if args.diff else ""
+    dependencies = render_dependencies(read_dependency_results(args.deps)) if args.deps else ""
     sys.stdout.write(
-        render_prompt(body, diff, retry=args.retry, empty_review=args.retry_empty)
+        render_prompt(
+            body,
+            diff,
+            retry=args.retry,
+            empty_review=args.retry_empty,
+            dependencies=dependencies,
+        )
     )
+    return 0
+
+
+def limit_message(run_summary: dict | None, max_cost: str, max_turns: str) -> str:
+    """Why a run that stopped at a limit has no result."""
+    limit = (run_summary or {}).get("limit") or ("cost" if max_cost else "")
+    if limit == "cost":
+        what = f"its cost limit (${max_cost})" if max_cost else "its cost limit"
+    elif limit == "turns":
+        what = f"its turn limit ({max_turns} model calls)" if max_turns else "its turn limit"
+    elif limit == "tokens":
+        what = "its token limit"
+    else:
+        what = "a limit"
+    return f"The agent stopped at {what} before it returned a result."
+
+
+def cmd_limit_message(args: argparse.Namespace) -> int:
+    stderr_text = ""
+    if args.stderr and Path(args.stderr).is_file():
+        stderr_text = Path(args.stderr).read_text(errors="replace")
+    print(limit_message(read_run_summary(stderr_text), args.max_cost, args.max_turns))
+    return 0
+
+
+def cmd_deps_plan(args: argparse.Namespace) -> int:
+    """Print one tab-separated install step per line: ecosystem, project
+    directory, image, dependency location, environment (KEY=VALUE, space
+    separated), command."""
+    try:
+        changed = Path(args.changed).read_text().splitlines()
+    except OSError:
+        changed = []
+    for step in deps_plan(Path(args.root), changed):
+        env = " ".join(f"{k}={v}" for k, v in step["env"].items())
+        print("\t".join([step["ecosystem"], step["dir"] or ".", step["image"], step["deps"], env, step["command"]]))
     return 0
 
 
@@ -1146,7 +1508,25 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--diff", required=True)
     render.add_argument("--retry", action="store_true")
     render.add_argument("--retry-empty", action="store_true")
+    render.add_argument("--deps", help="install-deps.sh results: ecosystem, location, status per line")
     render.set_defaults(func=cmd_render_prompt)
+
+    plan = sub.add_parser(
+        "deps-plan",
+        help="Print the dependency install steps for the projects that hold the changed files.",
+    )
+    plan.add_argument("--root", required=True)
+    plan.add_argument("--changed", required=True)
+    plan.set_defaults(func=cmd_deps_plan)
+
+    limit = sub.add_parser(
+        "limit-message",
+        help="Print why a run that stopped at a limit has no result.",
+    )
+    limit.add_argument("--stderr")
+    limit.add_argument("--max-cost", default=os.environ.get("CHECKS_MAX_COST", ""))
+    limit.add_argument("--max-turns", default=os.environ.get("CHECKS_MAX_TURNS", ""))
+    limit.set_defaults(func=cmd_limit_message)
 
     empty = sub.add_parser("empty-review")
     empty.add_argument("--verdict", required=True)

@@ -2,8 +2,10 @@
 # Run one check file. Path filters skip the agent and still publish a
 # successful check run, so a required status check does not stay pending.
 # A verdict that fails to parse is retried once. Configuration errors (exit 2)
-# and timeouts are not retried. CHECKS_TIMEOUT covers the first run and its
-# retry together, so a check fits in the job's time limit.
+# and timeouts are not retried, and neither is a run that stopped at a limit
+# (exit 3) but still gave a verdict: that verdict is kept as a partial review.
+# CHECKS_TIMEOUT covers the first run and its retry together, so a check fits
+# in the job's time limit.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,8 +79,13 @@ fi
 # The first run and its retry share one time limit.
 deadline=$((SECONDS + timeout_minutes * 60))
 
-# A retry needs at least this many seconds left to be worth starting.
-MIN_RETRY_SECONDS=120
+# A retry needs at least this much time left to be worth starting: a third of
+# the limit, and never less than two minutes. A retry that starts with too
+# little time is cut off by the timeout and ends with no result at all.
+MIN_RETRY_SECONDS=$((timeout_minutes * 60 / 3))
+if [ "$MIN_RETRY_SECONDS" -lt 120 ]; then
+  MIN_RETRY_SECONDS=120
+fi
 
 time_for_retry() {
   if [ $((deadline - SECONDS)) -ge "$MIN_RETRY_SECONDS" ]; then
@@ -98,6 +105,10 @@ run_agent() {
     render_args+=(--retry)
   elif [ "${1:-}" = "retry-empty" ]; then
     render_args+=(--retry-empty)
+  fi
+  # install-deps.sh's results: which dependencies the agent can read.
+  if [ -f /tmp/checks-deps.txt ]; then
+    render_args+=(--deps /tmp/checks-deps.txt)
   fi
   "${render_args[@]}" > "$prompt"
   # The caller turns errexit off around this call. Don't touch it here: turning
@@ -133,8 +144,10 @@ fi
 # What an earlier run of this check cost, added to the reported usage.
 spent_before=0
 
-# Set when the parsed verdict has no findings and did not finish, while the
-# diff is non-empty. That is not a review of the change.
+# Set when the agent finished normally (not at a limit), but its verdict has
+# no findings and did not finish, while the diff is non-empty. That is not a
+# review of the change. At a limit, the same verdict is an honest partial
+# review: the agent worked until the limit and found nothing.
 review_was_empty=false
 
 # Turns one agent run into a verdict file. Returns 1 when the output has no
@@ -149,13 +162,14 @@ judge_run() {
     message="$(tail -n 1 "$err" 2>/dev/null || true)"
     write_error_verdict "${message:-The agent rejected this provider configuration.}"
   elif bash "$script_dir/parse-verdict.sh" < "$raw" > "$verdict_file"; then
-    if python3 "$script_dir/checks.py" empty-review --verdict "$verdict_file" --diff /tmp/pr-truncated.diff; then
+    if [ "$code" -ne "$LIMIT_EXIT" ] &&
+      python3 "$script_dir/checks.py" empty-review --verdict "$verdict_file" --diff /tmp/pr-truncated.diff; then
       review_was_empty=true
       return 1
     fi
     return 0
   elif [ "$code" -eq "$LIMIT_EXIT" ]; then
-    write_verdict INCOMPLETE "The agent stopped at its cost limit (\$${CHECKS_MAX_COST:-?}) before it returned a result."
+    write_verdict INCOMPLETE "$(python3 "$script_dir/checks.py" limit-message --stderr "$err" --max-cost "${CHECKS_MAX_COST:-}")"
   else
     return 1
   fi
@@ -169,15 +183,33 @@ set -e
 
 if ! judge_run "$code"; then
   if [ "$review_was_empty" = true ]; then
-    if ! time_for_retry; then
+    # With a cost limit, the retry gets only what the first run left of it,
+    # so both runs together stay within the limit.
+    retry_max_cost=""
+    retry_ok=true
+    if [ -n "${CHECKS_MAX_COST:-}" ] && [ "$agent" = "nextcli" ]; then
+      if budget="$(python3 "$script_dir/checks.py" retry-budget --stderr "$err" --max-cost "$CHECKS_MAX_COST")"; then
+        read -r retry_max_cost spent_before <<< "$budget"
+      else
+        retry_ok=false
+        echo "::notice::check/${name} did not review the diff and has too little of its \$${CHECKS_MAX_COST} cost limit left for a retry."
+      fi
+    fi
+    if [ "$retry_ok" != true ] || ! time_for_retry; then
       write_verdict INCOMPLETE "The agent did not review the diff."
     else
-      # A cost limit does not block this retry: the first result reviewed nothing.
       set +e
-      run_agent retry-empty
+      if [ -n "$retry_max_cost" ]; then
+        CHECKS_MAX_COST="$retry_max_cost" run_agent retry-empty
+      else
+        run_agent retry-empty
+      fi
       code=$?
       set -e
-      if ! judge_run "$code"; then
+      if [ "$code" -eq 124 ]; then
+        # Never trade the first result for a timeout.
+        write_verdict INCOMPLETE "The agent did not review the diff, and its retry ran out of time."
+      elif ! judge_run "$code"; then
         if [ "$review_was_empty" = true ]; then
           write_verdict INCOMPLETE "The agent did not review the diff."
         else

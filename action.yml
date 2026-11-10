@@ -47,6 +47,14 @@ inputs:
     description: Output tokens one model call may produce, thinking included, for the nextcli agent. Empty uses the provider's default, which is 4,096 on DeepSeek and can be used up by thinking before the answer is written.
     required: false
     default: ""
+  max-turns:
+    description: Model calls one check may make, for the nextcli agent. At the limit the agent reports what it found so far, and the comment marks the review as partial. 0 for no limit. Other agents ignore it.
+    required: false
+    default: "60"
+  install:
+    description: auto (default) installs the dependencies of the projects that hold the changed files, so the agent can read a library inside the repository instead of searching the runner for it. npm, pnpm, yarn, NuGet, pip, Go, Cargo, Maven and Gradle are detected from their manifests. Each project is restored in a throwaway Docker container from its ecosystem's image, with no secrets and with the checks' base checkout hidden, because a restore can run code from the pull request. A failed install is a warning. none skips it.
+    required: false
+    default: auto
   results-dir:
     description: In comment mode, the directory that holds the check-*.verdict.json files from the run jobs, usually their downloaded check-results artifacts.
     required: false
@@ -138,6 +146,21 @@ runs:
         fetch-depth: 1
         persist-credentials: false
 
+    # Installing dependencies can run code from the pull request, and that code
+    # can write anywhere in the workspace. The checks are read from a copy
+    # outside it, made before anything is installed.
+    - name: Copy the checks out of the workspace
+      if: inputs.mode == 'run'
+      shell: bash
+      env:
+        SOURCE: ${{ github.workspace }}/.nextcli-checks-base/${{ inputs.checks-dir }}
+        TARGET: ${{ runner.temp }}/nextcli-checks
+      run: |
+        if [ -d "$SOURCE" ]; then
+          mkdir -p "$TARGET"
+          cp -R "$SOURCE/." "$TARGET/"
+        fi
+
     - name: List checks
       id: list
       if: inputs.mode == 'list'
@@ -192,6 +215,25 @@ runs:
         CHECKS_MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
       run: bash "$GITHUB_ACTION_PATH/scripts/prepare-diff.sh"
 
+    - name: Cache dependency downloads
+      if: inputs.mode == 'run' && steps.bot.outputs.skip != 'true' && inputs.install != 'none'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/checks-deps-cache
+        key: checks-deps-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/packages.lock.json', '**/*.csproj', '**/*.fsproj', '**/requirements*.txt', '**/go.sum', '**/Cargo.lock', '**/pom.xml', '**/*.gradle*') }}
+        restore-keys: checks-deps-${{ runner.os }}-
+
+    # A restore can run code from the pull request (dotnet restore targets,
+    # Gradle and setup.py scripts). It runs in throwaway containers, and this
+    # step gets no secrets.
+    - name: Install dependencies
+      if: inputs.mode == 'run' && steps.bot.outputs.skip != 'true' && inputs.install != 'none'
+      shell: bash
+      env:
+        CHECKS_INSTALL: ${{ inputs.install }}
+        CHECKS_DEPS_CACHE: ${{ runner.temp }}/checks-deps-cache
+      run: bash "$GITHUB_ACTION_PATH/scripts/install-deps.sh"
+
     - name: Run checks
       if: inputs.mode == 'run'
       shell: bash
@@ -204,9 +246,10 @@ runs:
         CHECKS_TIMEOUT: ${{ inputs.timeout-per-check }}
         CHECKS_MAX_COST: ${{ inputs.max-cost }}
         CHECKS_MAX_OUTPUT_TOKENS: ${{ inputs.max-output-tokens }}
+        CHECKS_MAX_TURNS: ${{ inputs.max-turns }}
         CHECKS_ON_ERROR: ${{ inputs.on-error }}
         CHECKS_ONLY: ${{ inputs.check }}
-        CHECKS_DIR: ${{ github.workspace }}/.nextcli-checks-base/${{ inputs.checks-dir }}
+        CHECKS_DIR: ${{ runner.temp }}/nextcli-checks
         CHECKS_SKIP_REASON: ${{ steps.bot.outputs.skip == 'true' && 'The head commit was made by github-actions[bot].' || '' }}
         GH_TOKEN: ${{ github.token }}
         GH_REPO: ${{ github.repository }}

@@ -141,7 +141,7 @@ Leave `base-url` empty for a named provider unless you need a gateway. Set `CHEC
 
 ### Inputs
 
-The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-cost`, `max-output-tokens`, `check`, `checks`, `base-url`, `checks-dir`, `pr-number`, `timeout-per-check` and `on-error`, and the `api-key` secret. `check` limits the matrix to one check and fails if that check does not exist. `checks` limits it to a comma-separated list of checks and skips, with a warning, any that does not exist; use it with a repository variable to control what a run costs. `max-cost` is a dollar cap per check (default `1`); it is enforced by `nextcli` and other agents print a notice that they ignore it. A run that exits at the cap is not retried. A `nextcli` run that ends without a verdict is retried once with what it left of the cap, so a review costs at most one cap. With `mode: comment` the action renders the combined comment from downloaded verdict files. `mode: list` only outputs the check names as a JSON array.
+The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-cost`, `max-output-tokens`, `max-turns`, `install`, `check`, `checks`, `base-url`, `checks-dir`, `pr-number`, `timeout-per-check` and `on-error`, and the `api-key` secret. `check` limits the matrix to one check and fails if that check does not exist. `checks` limits it to a comma-separated list of checks and skips, with a warning, any that does not exist; use it with a repository variable to control what a run costs. `max-cost` is a dollar cap per check (default `1`); it is enforced by `nextcli` and other agents print a notice that they ignore it. `max-turns` caps the model calls per check (default `60`, `nextcli` only). A run that stops at a cap and still gives a verdict keeps it, marked partial, and is not retried. A `nextcli` run that ends without a verdict, or with one that reviewed nothing, is retried once with what it left of the cost cap, so a review costs at most one cap, and only when a third of `timeout-per-check` is left. With `mode: comment` the action renders the combined comment from downloaded verdict files. `mode: list` only outputs the check names as a JSON array.
 
 | Input | Default | Description |
 | --- | --- | --- |
@@ -149,6 +149,8 @@ The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-
 | `agent-version` | empty | Version of the agent CLI to install. Defaults to `opencode-ai` 1.19.5, `@anthropic-ai/claude-code` 2.1.312, or `@nextcli/cli` 0.8.1. An installed `cn` at another version is replaced. |
 | `max-cost` | `1` | Dollar cap per check. `nextcli` stops at the cap and still returns a result; the comment marks that review partial. Other agents ignore it. |
 | `max-output-tokens` | empty | Output tokens one model call may produce, thinking included (`nextcli` only). Empty uses the provider's default, which is 4,096 on DeepSeek and can be used up by thinking before the answer. |
+| `max-turns` | `60` | Model calls one check may make (`nextcli` only). At the limit the agent reports what it found so far; the comment marks that review partial. `0` for no limit. |
+| `install` | `auto` | Installs the dependencies of the projects that hold the changed files, so the agent reads libraries inside the repository. See [Dependencies](#dependencies). `none` skips it. |
 | `nextcli-ref` | empty | Branch, tag, or commit SHA of NextCLI to build from source when `agent` is `nextcli`. When set, `agent-version` is ignored for `nextcli`. |
 | `nextcli-repository` | `https://github.com/nextcli-dev/nextcli.git` | Repository cloned when `nextcli-ref` is set. |
 | `timeout-per-check` | `10` | Minutes allowed for each check, its retry included, before it is reported as an error. |
@@ -158,6 +160,15 @@ The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-
 | `checks` | empty | Run only these checks, comma-separated (file names without `.md`). Empty runs all. Ignored when `check` is set. |
 | `checks-dir` | `.checks` | Directory of check markdown files, relative to the repository root, read from the base commit. |
 | `pr-number` | event's PR | Pull request to check. Required when the workflow is not triggered by a pull request. |
+
+### Dependencies
+
+With `install: auto` (the default), each check job installs the dependencies of the projects that hold the changed files before the agent starts. Without them the agent can't read a library the change uses, and spends its turns searching the runner for it.
+
+- **What is installed.** A changed file selects the ecosystems of its own kind (a `.ts` file JavaScript, a `.cs` file NuGet, and so on; a README selects none), and the nearest project above it: npm, pnpm or yarn (by lockfile), NuGet (`.sln`, `.csproj`, `.fsproj`, `.vbproj`), pip (`requirements.txt`, `pyproject.toml`), Go (`go.mod`), Cargo (`Cargo.lock`), Maven (the outermost `pom.xml`) and Gradle. At most six projects per ecosystem.
+- **Where.** JavaScript packages go to the project's `node_modules`. Everything else goes to `.checks-deps/<ecosystem>` in the repository, with a `.gitignore` of `*` so Search skips it. The prompt lists the locations, and the agent is told to read only inside the repository.
+- **How.** Each project is restored in a throwaway Docker container from its ecosystem's official image (`node`, `mcr.microsoft.com/dotnet/sdk`, `python`, `golang`, `rust`, `maven`, `gradle`), tagged from `.nvmrc`, `engines`, `global.json` or `go.mod` when the repository says. A restore can run code from the pull request (`dotnet restore` targets, Gradle and `setup.py` scripts), so the container gets no secrets, no runner files and no Docker socket: only the workspace, with `.git` read-only. The checks are read from a copy outside the workspace, made before anything is installed. JavaScript installs run with `--ignore-scripts`.
+- **Limits.** Six minutes for all installs in a job. A failed or skipped install is a warning, never a failed check, and the prompt says which libraries are missing. The job summary lists each install and its time. Downloads are cached by lockfile hash.
 | `mode` | `run` | `run` runs and reports checks. `comment` posts or updates the combined pull request comment. `list` only sets the `checks` output. |
 
 The `nextcli` agent installs `@nextcli/cli` from npm, pinned to `agent-version`. To run unreleased NextCLI code instead, set `nextcli-ref` and the action builds `cn` from source. The build adds several minutes to each job:

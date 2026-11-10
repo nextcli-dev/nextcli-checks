@@ -847,10 +847,112 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(len(verdict["findings"]), 1)
 
     def test_unfinished_verdict_with_no_findings_is_not_a_review(self):
-        result, verdict = self.run_check(3, self.VALID)
+        # A run that finished on its own (exit 0) and looked at nothing.
+        result, verdict = self.run_check(0, self.VALID)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(verdict["verdict"], "INCOMPLETE")
         self.assertIn("did not review the diff", verdict["summary"])
+
+    def run_sequence(self, runs, timeout="10", max_cost="2"):
+        """An agent that behaves like runs[i] on its i-th run: (exit code,
+        stdout, last stderr line). Returns the result, the verdict, and the
+        --max-cost each run got."""
+        record = self.root / "runs"
+        agent = self.scripts / "agents" / "nextcli.sh"
+        lines = ["#!/usr/bin/env bash", f"echo \"$CHECKS_MAX_COST\" >> '{record}'", f"n=$(wc -l < '{record}' | tr -d ' ')"]
+        for index, (code, stdout, stderr) in enumerate(runs, start=1):
+            lines += [
+                f"if [ \"$n\" -eq {index} ]; then",
+                f"  printf '%s' '{stdout}'",
+                f"  echo '{stderr}' >&2",
+                f"  exit {code}",
+                "fi",
+            ]
+        lines.append("exit 1")
+        agent.write_text("\n".join(lines) + "\n")
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "CHECKS_MAX_COST": max_cost,
+            "CHECKS_TIMEOUT": timeout,
+        }
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
+            env=env, capture_output=True, text=True,
+        )
+        return result, json.loads(self.verdict.read_text()), record.read_text().split()
+
+    def test_limit_exit_with_no_findings_is_kept_as_a_partial_review(self):
+        # Run 42693558895: a review that stopped at its cost cap after 82
+        # calls answered PASS with no findings. It was retried as "reviewed
+        # nothing", and the retry ran out of time.
+        answer = json.dumps(
+            {"verdict": "pass", "summary": "checked most files", "complete": False, "findings": []}
+        )
+        summary = '{"status":"limit","limit":"cost","usage":{"cost":1.84}}'
+        result, verdict, limits = self.run_sequence([(3, answer, summary)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "PASS")
+        self.assertFalse(verdict["complete"])
+        self.assertEqual(verdict["limit"], "cost")
+
+    def test_empty_review_is_retried_with_the_budget_left(self):
+        empty = json.dumps({"verdict": "PASS", "summary": "x", "complete": False, "findings": []})
+        found = json.dumps(
+            {"verdict": "FAIL", "summary": "found one", "complete": True,
+             "findings": [{"file": "a.ts", "title": "Bug", "details": "x"}]}
+        )
+        result, verdict, limits = self.run_sequence([
+            (0, empty, '{"status":"done","limit":null,"usage":{"cost":0.5}}'),
+            (0, found, '{"status":"done","limit":null,"usage":{"cost":0.3}}'),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2", "1.5000"])
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertAlmostEqual(verdict["usage"]["cost"], 0.8)
+
+    def test_empty_review_retry_that_times_out_is_incomplete_not_an_error(self):
+        empty = json.dumps({"verdict": "PASS", "summary": "x", "complete": False, "findings": []})
+        result, verdict, limits = self.run_sequence([
+            (0, empty, '{"status":"done","limit":null,"usage":{"cost":0.5}}'),
+            (124, "", ""),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(limits), 2)
+        self.assertEqual(verdict["verdict"], "INCOMPLETE")
+        self.assertIn("ran out of time", verdict["summary"])
+
+    def test_empty_review_is_not_retried_without_budget(self):
+        empty = json.dumps({"verdict": "PASS", "summary": "x", "complete": False, "findings": []})
+        result, verdict, limits = self.run_sequence([
+            (0, empty, '{"status":"done","limit":null,"usage":{"cost":1.95}}'),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "INCOMPLETE")
+        self.assertIn("did not review the diff", verdict["summary"])
+
+    def test_no_retry_with_less_than_a_third_of_the_time_left(self):
+        # A 1-minute limit is under the 2-minute floor for a retry.
+        result, verdict, limits = self.run_sequence(
+            [(1, "", '{"status":"error","message":"boom","usage":{"cost":0.1}}')], timeout="1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "ERROR")
+        self.assertIn("too little", result.stdout)
+
+    def test_turn_limit_without_an_answer_names_the_turn_limit(self):
+        result, verdict, _limits = self.run_sequence(
+            [(3, "", '{"status":"limit","limit":"turns","usage":{"cost":0.4}}')]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verdict["verdict"], "INCOMPLETE")
+        self.assertIn("turn limit", verdict["summary"])
 
     def test_rejected_configuration_becomes_an_error_verdict(self):
         result, verdict = self.run_check(2)
@@ -912,6 +1014,236 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(limits, ["2"])
         self.assertEqual(verdict["verdict"], "ERROR")
         self.assertIn("finished without writing an answer", verdict["summary"])
+
+
+class DepsPlanTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, rel: str, text: str = "") -> None:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def plan(self, *changed: str) -> list[tuple[str, str]]:
+        return [(s["ecosystem"], s["dir"]) for s in checks.deps_plan(self.root, list(changed))]
+
+    def test_nearest_lockfile_in_a_repository_without_workspaces(self):
+        self.write("package-lock.json", "{}")
+        self.write("packages/a/package-lock.json", "{}")
+        self.write("packages/a/src/x.ts")
+        self.assertEqual(self.plan("packages/a/src/x.ts", "tools/y.js"), [("npm", ""), ("npm", "packages/a")])
+
+    def test_files_that_are_not_code_install_nothing(self):
+        self.write("package-lock.json", "{}")
+        self.write("pyproject.toml", "[project]\nname='x'\n")
+        self.assertEqual(self.plan("README.md", "docs/guide.md", ".github/workflows/ci.yml"), [])
+
+    def test_only_the_ecosystem_of_the_changed_file(self):
+        # A Python helper in a TypeScript repository installs Python only.
+        self.write("package-lock.json", "{}")
+        self.write("pyproject.toml", "[project]\nname='x'\n")
+        self.assertEqual(self.plan("scripts/tool.py"), [("pip", "")])
+        self.assertEqual(self.plan("src/a.ts"), [("npm", "")])
+
+    def test_dotnet_restores_the_solution_next_to_the_project(self):
+        self.write("App.sln")
+        self.write("App.csproj")
+        self.write("global.json", '{"sdk": {"version": "8.0.403"}}')
+        (step,) = checks.deps_plan(self.root, ["Program.cs"])
+        self.assertEqual(step["ecosystem"], "nuget")
+        self.assertEqual(step["command"], "dotnet restore 'App.sln'")
+        self.assertEqual(step["image"], "mcr.microsoft.com/dotnet/sdk:8.0")
+        self.assertEqual(step["env"]["NUGET_PACKAGES"], "/work/.checks-deps/nuget")
+        self.assertEqual(step["deps"], ".checks-deps/nuget")
+
+    def test_dotnet_project_without_a_solution(self):
+        self.write("src/Lib/Lib.csproj")
+        (step,) = checks.deps_plan(self.root, ["src/Lib/Thing.cs"])
+        self.assertEqual((step["dir"], step["command"]), ("src/Lib", "dotnet restore 'Lib.csproj'"))
+
+    def test_other_ecosystems(self):
+        self.write("go.mod", "module x\n\ngo 1.23.4\n")
+        self.write("Cargo.toml")
+        self.write("Cargo.lock")
+        self.write("pom.xml")
+        self.write("mod/pom.xml")
+        plan = {s["ecosystem"]: s for s in checks.deps_plan(self.root, ["a.go", "src/lib.rs", "mod/src/A.java"])}
+        self.assertEqual(plan["go"]["image"], "golang:1.23")
+        self.assertEqual(plan["cargo"]["command"], "cargo fetch")
+        # Maven builds from the outermost pom, the root of the reactor.
+        self.assertEqual(plan["maven"]["dir"], "")
+
+    def test_node_version_from_nvmrc_and_engines(self):
+        self.write("a/package-lock.json", "{}")
+        self.write("a/.nvmrc", "v20.11.0\n")
+        self.write("b/package-lock.json", "{}")
+        self.write("b/package.json", '{"engines": {"node": ">=24.1"}}')
+        images = {s["dir"]: s["image"] for s in checks.deps_plan(self.root, ["a/x.js", "b/y.ts"])}
+        self.assertEqual(images, {"a": "node:20", "b": "node:24"})
+
+    def test_pnpm_and_yarn_lockfiles(self):
+        self.write("p/pnpm-lock.yaml")
+        self.write("y/yarn.lock", "# yarn lockfile v1\n")
+        self.write("z/yarn.lock", "__metadata:\n  version: 8\n")
+        commands = {s["dir"]: s["command"] for s in checks.deps_plan(self.root, ["p/a.ts", "y/a.ts", "z/a.ts"])}
+        self.assertIn("pnpm install --frozen-lockfile --ignore-scripts", commands["p"])
+        self.assertIn("--ignore-scripts", commands["y"])
+        self.assertIn("--mode=skip-build", commands["z"])
+
+    def test_dependencies_and_the_base_checkout_are_not_projects(self):
+        self.write("package-lock.json", "{}")
+        self.assertEqual(self.plan("node_modules/x/index.js", ".nextcli-checks-base/a.ts", ".checks-deps/go/x.go"), [])
+
+    def test_too_many_projects_are_capped(self):
+        changed = []
+        for i in range(checks.MAX_PROJECTS_PER_ECOSYSTEM + 2):
+            self.write(f"p{i}/package-lock.json", "{}")
+            changed.append(f"p{i}/a.ts")
+        self.assertEqual(len(self.plan(*changed)), checks.MAX_PROJECTS_PER_ECOSYSTEM)
+
+    def test_dependencies_section_in_the_prompt(self):
+        none = checks.render_prompt("Check.", "diff")
+        self.assertIn("Dependencies are not installed", none)
+        self.assertIn("Read only paths inside the repository", none)
+        some = checks.render_dependencies([("npm", "a/node_modules", "ok"), ("nuget", ".checks-deps/nuget", "failed")])
+        self.assertIn("- npm: `a/node_modules`", some)
+        self.assertIn("could not be installed: nuget", some)
+        self.assertNotIn("compiled", some)
+
+    def test_diff_comes_first_and_placeholders_in_it_stay_text(self):
+        text = checks.render_prompt("CHECK BODY", "+ @@CHECK_BODY@@ in a diff")
+        self.assertLess(text.index("## PR Diff"), text.index("## Check"))
+        self.assertIn("+ @@CHECK_BODY@@ in a diff", text)
+        self.assertEqual(text.count("CHECK BODY"), 1)
+
+
+class InstallDepsTest(unittest.TestCase):
+    """install-deps.sh with a fake docker that records what it was asked."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.workspace = root / "work"
+        (self.workspace / "pkg" / "src").mkdir(parents=True)
+        (self.workspace / "pkg" / "package-lock.json").write_text("{}")
+        (self.workspace / ".git").mkdir()
+        (self.workspace / ".nextcli-checks-base" / ".checks").mkdir(parents=True)
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.calls = root / "docker-calls"
+        self.cache = root / "cache"
+        timeout = self.bin / "timeout"
+        # GNU timeout isn't on macOS: drop the options and the duration.
+        timeout.write_text('#!/usr/bin/env bash\nwhile [[ "$1" == -* ]]; do shift; done\nshift\nexec "$@"\n')
+        timeout.chmod(0o755)
+        self.changed = Path("/tmp/changed-files.txt")
+        self.results = Path("/tmp/checks-deps.txt")
+        self.summary = root / "summary.md"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        for path in (self.changed, self.results):
+            path.unlink(missing_ok=True)
+
+    def run_install(self, docker_exit: int = 0, mode: str = "auto"):
+        docker = self.bin / "docker"
+        docker.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> '{self.calls}'\n"
+            f"[ \"$1\" = run ] && exit {docker_exit}\n"
+            "exit 0\n"
+        )
+        docker.chmod(0o755)
+        self.changed.write_text("pkg/src/a.ts\nREADME.md\n")
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "GITHUB_WORKSPACE": str(self.workspace),
+            "GITHUB_STEP_SUMMARY": str(self.summary),
+            "CHECKS_INSTALL": mode,
+            "CHECKS_DEPS_CACHE": str(self.cache),
+            "PROVIDER_API_KEY": "sk-secret-value",
+        }
+        result = subprocess.run(
+            ["bash", str(Path(__file__).parent / "install-deps.sh")],
+            env=env, capture_output=True, text=True,
+        )
+        calls = self.calls.read_text().splitlines() if self.calls.exists() else []
+        return result, calls
+
+    def test_installs_in_a_container_without_secrets(self):
+        result, calls = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (run,) = [c for c in calls if c.startswith("run ")]
+        self.assertIn("node:22", run)
+        self.assertIn("npm ci --ignore-scripts", run)
+        self.assertIn("-w /work/pkg", run)
+        self.assertIn(f"-v {self.workspace}/.git:/work/.git:ro", run)
+        self.assertNotIn("sk-secret-value", run)
+        self.assertNotIn("PROVIDER_API_KEY", run)
+        self.assertNotIn("docker.sock", run)
+        self.assertEqual(self.results.read_text(), "npm\tpkg/node_modules\tok\n")
+        self.assertEqual((self.workspace / ".checks-deps" / ".gitignore").read_text(), "*\n")
+        self.assertIn("installed in", self.summary.read_text())
+
+    def test_a_failed_install_is_a_warning(self):
+        result, _calls = self.run_install(docker_exit=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("::warning::Could not install npm", result.stdout)
+        self.assertEqual(self.results.read_text(), "npm\tpkg/node_modules\tfailed\n")
+
+    def test_install_none_runs_nothing(self):
+        result, calls = self.run_install(mode="none")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.results.read_text(), "")
+
+
+class NextcliAgentArgsTest(unittest.TestCase):
+    """nextcli.sh passes the turn limit to cn."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.args = root / "args"
+        cn = self.bin / "cn"
+        cn.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > '{self.args}'\n")
+        cn.chmod(0o755)
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("Check.")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_agent(self, max_turns: str) -> list[str]:
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "PROVIDER_API_KEY": "k",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "CHECKS_BASE_URL": "https://example.invalid/v1",
+            "CHECKS_MAX_TURNS": max_turns,
+        }
+        result = subprocess.run(
+            ["bash", str(Path(__file__).parent / "agents" / "nextcli.sh"), str(self.prompt)],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.args.read_text().splitlines()
+
+    def test_turn_limit_is_passed(self):
+        args = self.run_agent("60")
+        self.assertEqual(args[args.index("--max-turns") + 1], "60")
+
+    def test_zero_turns_means_no_limit(self):
+        self.assertNotIn("--max-turns", self.run_agent("0"))
+        self.assertNotIn("--max-turns", self.run_agent(""))
 
 
 if __name__ == "__main__":
