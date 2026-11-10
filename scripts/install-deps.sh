@@ -4,10 +4,19 @@
 # caches and system folders on the runner.
 #
 # Each project is restored in a throwaway container from its ecosystem's
-# official image (see `checks.py deps-plan`). The container does not run
-# project code: npm, pnpm, and yarn with scripts off, pip from a requirements
-# file with wheels only, go mod download, and cargo fetch --locked. NuGet,
-# Maven, and Gradle are not installed. The checkout is mounted read-only.
+# official image (see `checks.py deps-plan`). Nothing from the pull request
+# runs, and nothing in it picks the program that does:
+# - npm ci, and pnpm and Yarn 1 at versions this action pins, installed from
+#   the public registry outside the project (no Corepack, no packageManager):
+#   scripts off, no pnpmfile, no .yarnrc yarn-path or rc arguments, file:
+#   directories linked, not packed. A lockfile with git dependencies is not
+#   installed: packing one runs its prepare script.
+# - pip from a requirements list checks.py rebuilds (no options, editable,
+#   path, or URL lines), wheels only, run outside the project.
+# - go mod download, and cargo fetch --locked run outside the project, so no
+#   .cargo/config.toml or rust-toolchain.toml is read.
+# NuGet, Maven, Gradle, and Yarn 2+ are not installed. The checkout is
+# mounted read-only.
 # Writable mounts are .checks-deps and, for JavaScript, the project's
 # node_modules and those of its workspace packages. Each must be a plain
 # directory of the checkout or not exist yet: a symlink committed in the pull
@@ -90,6 +99,30 @@ unsafe_write_dir() {
   return 1
 }
 
+# Writes a .gitignore of "*" into a directory the container could write, so
+# Search skips it. Run after the container exited: anything named .gitignore
+# there is removed first, and the new file is created without following a
+# symlink, so a link the container left can't redirect the write.
+mark_ignored() {
+  local rel="$1"
+  if unsafe_write_dir "$rel" || [ ! -d "$workspace/$rel" ]; then
+    return 0
+  fi
+  python3 -c '
+import os, stat, sys
+path = os.path.join(sys.argv[1], ".gitignore")
+try:
+    if stat.S_ISDIR(os.lstat(path).st_mode):
+        sys.exit(0)
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+os.write(fd, b"*\n")
+os.close(fd)
+' "$workspace/$rel" || true
+}
+
 prepared=""
 prepare_workspace() {
   if [ -n "$prepared" ]; then
@@ -103,7 +136,7 @@ prepare_workspace() {
   fi
   mkdir -p "$workspace/$DEPS_DIR" "$cache"
   # Search (rg) skips ignored files, so installed packages don't flood results.
-  printf '*\n' > "$workspace/$DEPS_DIR/.gitignore"
+  mark_ignored "$DEPS_DIR"
   prepared=ok
 }
 
@@ -138,6 +171,8 @@ while IFS= read -r line || [ -n "$line" ]; do
       summary_lines+=("| ${ecosystem} | \`${project}\` | skipped, no time left |")
     elif [ "$reason" = "layout" ]; then
       summary_lines+=("| ${ecosystem} | \`${project}\` | skipped, the install would write outside node_modules |")
+    elif [ -n "$dir" ]; then
+      summary_lines+=("| ${ecosystem} | \`${project}\` | skipped (${reason}) |")
     else
       summary_lines+=("| ${ecosystem} | — | skipped (${reason}) |")
     fi
@@ -172,15 +207,27 @@ while IFS= read -r line || [ -n "$line" ]; do
   image="$(json_get "$line" image)"
   prelude="$(json_get "$line" prelude)"
   mount_nm="$(json_get "$line" mount_node_modules)"
+  tool="$(json_get "$line" tool)"
+  cwd="$(json_get "$line" cwd)"
+  note="$(json_get "$line" note)"
+  # Fixed preludes. None takes text from the project; the command follows
+  # as "$@".
   case "$prelude" in
     "")
       script='mkdir -p /tmp/home && exec "$@"'
       ;;
-    corepack)
-      script='mkdir -p /tmp/home/bin && { corepack enable --install-directory /tmp/home/bin 2>/dev/null || npx --yes corepack enable --install-directory /tmp/home/bin; } && export PATH=/tmp/home/bin:$PATH && exec "$@"'
+    tool)
+      # The package manager, at the version in CHECKS_TOOL, from the public
+      # registry. Installed from /tmp, so the project's .npmrc is not read.
+      script='mkdir -p /tmp/home && (cd /tmp && npm install --global --prefix /tmp/home/tools --userconfig /dev/null --ignore-scripts --no-audit --no-fund --loglevel=error --registry https://registry.npmjs.org/ "$CHECKS_TOOL") && export PATH=/tmp/home/tools/bin:$PATH && exec "$@"'
       ;;
-    corepack-yarn1)
-      script='mkdir -p /tmp/home/bin && { corepack enable --install-directory /tmp/home/bin 2>/dev/null || npx --yes corepack enable --install-directory /tmp/home/bin; } && export PATH=/tmp/home/bin:$PATH && corepack prepare yarn@1.22.22 --activate && exec "$@"'
+    go-cache)
+      # Downloads go back to the action's cache, in GOPROXY layout.
+      script='mkdir -p /tmp/home && "$@" && if [ -d "$GOMODCACHE/cache/download" ]; then mkdir -p /cache/go && cp -R "$GOMODCACHE/cache/download/." /cache/go/; fi'
+      ;;
+    cargo-cache)
+      # Crates and the index come from the action's cache, and go back to it.
+      script='mkdir -p /tmp/home "$CARGO_HOME" && if [ -d /cache/cargo ]; then cp -R /cache/cargo/. "$CARGO_HOME"/; fi && "$@" && for d in registry/cache registry/index git/db; do if [ -d "$CARGO_HOME/$d" ]; then mkdir -p "/cache/cargo/$d" && cp -R "$CARGO_HOME/$d/." "/cache/cargo/$d/"; fi; done'
       ;;
     *)
       echo "::warning::Unknown install prelude for ${ecosystem}. Dependencies in ${project} were not installed."
@@ -198,6 +245,15 @@ while IFS= read -r line || [ -n "$line" ]; do
   while IFS= read -r -d '' pair; do
     [ -n "$pair" ] && env_args+=(-e "$pair")
   done < <(python3 -c 'import json,sys; data=json.loads(sys.argv[1]); items=[f"{key}={value}".encode() for key, value in (data.get("env") or {}).items()]; sys.stdout.buffer.write(b"\0".join(items) + (b"\0" if items else b""))' "$line")
+  if [ "$prelude" = tool ]; then
+    if ! [[ "$tool" =~ ^(pnpm@[0-9]+\.[0-9]+\.[0-9]+|yarn@1\.22\.22)$ ]]; then
+      echo "::warning::Unknown package manager for ${ecosystem}. Dependencies in ${project} were not installed."
+      record "$ecosystem" "$deps" failed tool
+      summary_lines+=("| ${ecosystem} | \`${project}\` | failed (unknown package manager) |")
+      continue
+    fi
+    env_args+=(-e "CHECKS_TOOL=${tool}")
+  fi
 
   # Every directory the container may write, relative to the workspace.
   writable=()
@@ -225,7 +281,10 @@ while IFS= read -r line || [ -n "$line" ]; do
     continue
   fi
 
-  if [ -n "$dir" ]; then
+  if [ "$cwd" = tmp ]; then
+    # Outside the project: no project config file is found from here.
+    workdir="/tmp"
+  elif [ -n "$dir" ]; then
     workdir="/work/${dir}"
   else
     workdir="/work"
@@ -235,6 +294,23 @@ while IFS= read -r line || [ -n "$line" ]; do
     mkdir -p "$workspace/$rel"
     mounts+=(-v "$workspace/$rel:/work/$rel")
   done
+  # Files the planner wrote for this step (pip's rebuilt requirements),
+  # mounted read-only at /reqs.
+  files_dir=""
+  if python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get("files") else 1)' "$line"; then
+    files_dir="$(mktemp -d)"
+    python3 -c '
+import json, os, re, sys
+files = json.loads(sys.argv[1]).get("files") or {}
+for name, text in files.items():
+    if not re.fullmatch(r"(requirements|constraints)\.txt", name):
+        sys.exit("unexpected file name")
+    with open(os.path.join(sys.argv[2], name), "w") as handle:
+        handle.write(text)
+' "$line" "$files_dir"
+    chmod -R a+rX "$files_dir"
+    mounts+=(-v "$files_dir:/reqs:ro")
+  fi
 
   container="checks-deps-$$-${RANDOM}"
   started=$SECONDS
@@ -258,12 +334,24 @@ while IFS= read -r line || [ -n "$line" ]; do
   # timeout stops the client, not the container.
   "$docker" rm -f "$container" >/dev/null 2>&1 || true
   echo "::endgroup::"
+  if [ -n "$files_dir" ]; then
+    rm -rf "$files_dir"
+  fi
+  # Search skips what the container wrote.
+  mark_ignored "$DEPS_DIR"
+  for rel in ${writable[@]+"${writable[@]}"}; do
+    mark_ignored "$rel"
+  done
 
   took=$((SECONDS - started))
   if [ "$code" -eq 0 ]; then
     echo "Installed ${ecosystem} dependencies in ${project} in ${took} s."
-    record "$ecosystem" "$deps" ok ""
-    summary_lines+=("| ${ecosystem} | \`${project}\` | installed in ${took} s |")
+    record "$ecosystem" "$deps" ok "$note"
+    if [ "$note" = partial ]; then
+      summary_lines+=("| ${ecosystem} | \`${project}\` | installed in ${took} s; editable, path, and URL requirements skipped |")
+    else
+      summary_lines+=("| ${ecosystem} | \`${project}\` | installed in ${took} s |")
+    fi
   else
     echo "::warning::Could not install ${ecosystem} dependencies in ${project} (exit ${code}). The checks run without them."
     record "$ecosystem" "$deps" failed ""

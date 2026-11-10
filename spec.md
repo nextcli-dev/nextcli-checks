@@ -328,7 +328,12 @@ The workflow in [`.github/workflows/checks.yml`](./.github/workflows/checks.yml)
 
 `max-cost` (default `1`) is the dollar cap per check. `nextcli` enforces it with `--max-cost` and, when the cap is reached, still returns a result. The comment marks that review partial (`complete: false`, or verdict `INCOMPLETE` when the agent stopped before a verdict). `max-turns` caps the model calls the same way, with `--max-turns`. Empty (the default) allows one call per 20 seconds of the time left, at most 60. A run that reached a cap and still gave a verdict keeps it as a partial review and is not retried, even when it found nothing. A partial pass does not count as a successful check run; the comment still shows it. A `nextcli` run that ended without a verdict (an error, or no answer), or that finished on its own without reviewing the diff, is retried once with `--max-cost` set to what it left of the cap, if that is at least 10% of the cap, and the reported cost covers both runs. A retry starts only with a third of `timeout-per-check` left, and a retry that runs out of time never replaces the first result with a timeout. Other agents print a notice and ignore the cost cap, and ignore the turn cap.
 
-Before the agent starts, `install: auto` (default `none`; a check's frontmatter overrides it) restores dependencies that can be downloaded without running project code (npm, pnpm, and yarn with scripts off, pip from a requirements file with wheels only, `go mod download`, and `cargo fetch --locked`), in a throwaway container with the checkout read-only and no secrets. NuGet, Maven, Gradle, and Yarn 2+ are not installed. See the README's Dependencies section.
+Before the agent starts, `install: auto` (default `none`; a check's frontmatter overrides it) restores dependencies without running anything from the pull request, in a throwaway container with the checkout read-only and no secrets:
+- npm, pnpm, and Yarn 1 run with scripts off, at pinned versions for pnpm and Yarn, with no pnpmfile, rc arguments, or git dependencies;
+- pip installs wheels from a requirements list the action rebuilds;
+- `go mod download` and `cargo fetch --locked` run outside the project.
+
+NuGet, Maven, Gradle, and Yarn 2+ are not installed. The prompt marks installed dependencies as untrusted. See the README's Dependencies section.
 
 When a check passes, its section of the comment says so. A failing check lists findings in the same comment. A later run updates that comment instead of adding another. An earlier v2 "changes requested" review is dismissed.
 

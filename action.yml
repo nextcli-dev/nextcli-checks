@@ -52,7 +52,7 @@ inputs:
     required: false
     default: ""
   install:
-    description: none (default) or auto. auto installs the dependencies of the projects that hold the changed files, so the agent can read a library inside the repository instead of searching the runner for it. npm, pnpm, and Yarn 1 (scripts off), pip (requirements files, wheels only), Go, and Cargo run in a throwaway container. The checkout is read-only and project code does not run. NuGet, Maven, Gradle, and Yarn 2+ are not installed. A check can set `install:` in its frontmatter to override this. Nothing is installed for a check that its paths skip. A failed install is a warning.
+    description: none (default) or auto. auto installs the dependencies of the projects that hold the changed files, so the agent can read a library inside the repository instead of searching the runner for it. npm, pnpm, and Yarn 1 (scripts, pnpmfiles, and git dependencies off; pnpm and Yarn at pinned versions), pip (a rebuilt requirements list, wheels only), Go, and Cargo run in a throwaway container. The checkout is read-only and nothing from the pull request runs. NuGet, Maven, Gradle, and Yarn 2+ are not installed. A check can set `install:` in its frontmatter to override this. Nothing is installed for a check that its paths skip. A failed install is a warning.
     required: false
     default: none
   results-dir:
@@ -235,9 +235,16 @@ runs:
         echo "install=${wanted}" >> "$GITHUB_OUTPUT"
         echo "Dependency install: ${wanted}"
 
-    - name: Cache dependency downloads
+    # Download caches for every ecosystem (npm, pnpm, Yarn, pip, Go, Cargo).
+    # Each package manager checks what it takes from here against the
+    # lockfile or the index, so an older cache from restore-keys only costs
+    # space. It is saved only from pull_request runs, whose caches only that
+    # pull request reads; a workflow_dispatch run would save to the default
+    # branch, which every pull request reads.
+    - name: Restore dependency downloads
+      id: deps-cache
       if: inputs.mode == 'run' && steps.install.outputs.install == 'auto'
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/checks-deps-cache
         key: checks-deps-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/requirements*.txt', '**/go.sum', '**/Cargo.lock') }}
@@ -253,6 +260,13 @@ runs:
         CHECKS_INSTALL: auto
         CHECKS_DEPS_CACHE: ${{ runner.temp }}/checks-deps-cache
       run: bash "$GITHUB_ACTION_PATH/scripts/install-deps.sh"
+
+    - name: Save dependency downloads
+      if: always() && inputs.mode == 'run' && steps.install.outputs.install == 'auto' && github.event_name == 'pull_request' && steps.deps-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/checks-deps-cache
+        key: ${{ steps.deps-cache.outputs.cache-primary-key }}
 
     - name: Run checks
       if: inputs.mode == 'run'
