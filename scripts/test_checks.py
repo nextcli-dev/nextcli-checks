@@ -1894,5 +1894,118 @@ class ReportRetryTest(unittest.TestCase):
         self.assertNotIn("retrying", result.stderr)
 
 
+
+class NeutralizePrConfigTest(unittest.TestCase):
+    """Agent configuration a pull request adds is moved out of the checkout."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.checkout = root / "checkout"
+        self.dest = root / "moved"
+        self.summary = root / "summary.md"
+        self.checkout.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, rel: str, text: str = "x") -> None:
+        path = self.checkout / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def run_script(self) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(Path(__file__).parent / "neutralize-pr-config.sh"),
+             str(self.checkout), str(self.dest)],
+            env={**os.environ, "GITHUB_STEP_SUMMARY": str(self.summary)},
+            capture_output=True, text=True,
+        )
+
+    def test_moves_agent_configuration_and_keeps_the_code(self):
+        planted = [
+            ".env", ".env.local", ".claude/settings.json", ".mcp.json",
+            "opencode.json", ".opencode/plugin/x.ts", ".continue/.env",
+            ".continue/settings.json", ".continue/environment.json",
+        ]
+        for rel in planted:
+            self.write(rel)
+        kept = ["src/app.ts", "README.md", "AGENTS.md", ".continue/rules/style.md",
+                ".checks/review.md", "package.json"]
+        for rel in kept:
+            self.write(rel)
+        (self.checkout / ".env.link").symlink_to("/etc/hostname")
+
+        result = self.run_script()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for rel in planted + [".env.link"]:
+            self.assertFalse(os.path.lexists(self.checkout / rel), rel)
+        for rel in planted:
+            self.assertTrue((self.dest / rel).exists(), rel)
+        self.assertTrue((self.dest / ".env.link").is_symlink())
+        for rel in kept:
+            self.assertTrue((self.checkout / rel).exists(), rel)
+        self.assertIn("`.claude`", self.summary.read_text())
+
+    def test_a_checkout_without_agent_configuration_is_left_alone(self):
+        self.write("src/app.ts")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.summary.exists())
+
+
+class AgentProjectConfigTest(unittest.TestCase):
+    """Claude Code and OpenCode don't read the pull request's own configuration."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.out = root / "out"
+        for name in ("claude", "opencode"):
+            stub = self.bin / name
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f"{{ printf '%s\\n' \"$@\"; env; }} > '{self.out}'\n"
+            )
+            stub.chmod(0o755)
+        self.prompt = root / "prompt.md"
+        self.prompt.write_text("Check.")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_agent(self, agent: str, provider: str) -> list[str]:
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "PROVIDER_API_KEY": "k",
+            "CHECKS_PROVIDER": provider,
+            "CHECKS_MODEL": "m",
+        }
+        result = subprocess.run(
+            ["bash", str(Path(__file__).parent / "agents" / f"{agent}.sh"), str(self.prompt)],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.out.read_text().splitlines()
+
+    def test_claude_code_reads_user_settings_only(self):
+        lines = self.run_agent("claude-code", "anthropic")
+        self.assertEqual(lines[lines.index("--setting-sources") + 1], "user")
+        # The check still runs, in plan mode
+        self.assertEqual(lines[lines.index("--permission-mode") + 1], "plan")
+
+    def test_opencode_skips_project_configuration(self):
+        lines = self.run_agent("opencode", "anthropic")
+        self.assertIn("OPENCODE_DISABLE_PROJECT_CONFIG=1", lines)
+        self.assertIn("OPENCODE_DISABLE_CLAUDE_CODE=1", lines)
+        # Its own configuration still arrives
+        self.assertTrue(any(line.startswith("OPENCODE_CONFIG_CONTENT=") for line in lines))
+
+
 if __name__ == "__main__":
     unittest.main()

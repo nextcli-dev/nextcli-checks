@@ -20,6 +20,11 @@ if [ "$CHECKS_PROVIDER" = "openai-compatible" ] && [ -z "${CHECKS_BASE_URL:-}" ]
 fi
 
 export OPENCODE_DISABLE_AUTOUPDATE=1
+# OpenCode has no folder trust: without these it loads the pull request's
+# opencode.json, .opencode/ plugins and MCP commands, and its .claude/ files.
+# It then also skips the repository's AGENTS.md.
+export OPENCODE_DISABLE_PROJECT_CONFIG=1
+export OPENCODE_DISABLE_CLAUDE_CODE=1
 OPENCODE_CONFIG_CONTENT="$(python3 "$script_dir/../checks.py" opencode-config)"
 export OPENCODE_CONFIG_CONTENT
 

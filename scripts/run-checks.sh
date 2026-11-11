@@ -59,6 +59,10 @@ if [ -n "${CHECKS_SKIP_REASON:-}" ]; then
   exit 0
 fi
 
+# The checkout is the pull request's head: agent configuration in it was
+# written by whoever opened the pull request
+bash "$script_dir/neutralize-pr-config.sh" .
+
 for name in "${names[@]}"; do
   bash "$script_dir/run-check.sh" "${checks_dir}/${name}.md"
 done
