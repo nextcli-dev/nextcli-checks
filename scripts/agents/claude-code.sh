@@ -37,7 +37,11 @@ case "$CHECKS_PROVIDER" in
     ;;
 esac
 
+# --setting-sources user: the pull request's .claude/settings.json (hooks, an
+# env block) and .mcp.json are not read, even if neutralize-pr-config.sh
+# missed one. claude -p never asks whether to trust a folder.
 exec claude -p "$(cat "$prompt_file")" \
   --output-format json \
   --permission-mode plan \
+  --setting-sources user \
   --model "$CHECKS_MODEL"
