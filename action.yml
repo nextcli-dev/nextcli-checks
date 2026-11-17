@@ -20,7 +20,7 @@ inputs:
     required: false
     default: opencode
   agent-version:
-    description: Version of the agent CLI to install. Defaults to opencode-ai 1.19.5, @anthropic-ai/claude-code 2.1.312, or @nextcli/cli 0.8.1. Ignored for nextcli when nextcli-ref is set.
+    description: Version of the agent CLI to install. Defaults to opencode-ai 1.19.5, @anthropic-ai/claude-code 2.1.312, or @nextcli/cli 0.13.0. Ignored for nextcli when nextcli-ref is set.
     required: false
     default: ""
   provider:
@@ -60,7 +60,7 @@ inputs:
     required: false
     default: ""
   timeout-per-check:
-    description: Minutes allowed for each check, its retry included, before it is reported as an error.
+    description: Minutes allowed for each check, its retry included, before it is reported as an error. The nextcli agent (@nextcli/cli 0.13.0 or later) gets --max-time of the time left minus a minute, so it reports what it found so far before the timeout, and the comment marks the review as partial.
     required: false
     default: "10"
   max-diff-bytes:

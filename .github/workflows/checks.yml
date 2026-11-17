@@ -81,7 +81,7 @@ on:
         type: string
         default: ""
       timeout-per-check:
-        description: Minutes allowed per check, its retry included
+        description: Minutes allowed per check, its retry included. nextcli (0.13.0 or later) stops a minute early and reports what it found so far.
         type: string
         default: "10"
       on-error:

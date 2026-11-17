@@ -44,8 +44,9 @@ case "$agent" in
       cn --version
       exit 0
     fi
-    # Bump this default with each @nextcli/cli release. 0.1.0 is deprecated (interactive mode exits at startup).
-    version="${version:-0.8.1}"
+    # Bump this default with each @nextcli/cli release: the CLI release
+    # checklist in nextcli's MAINTAINING.md lists every place that names it.
+    version="${version:-0.13.0}"
     if command -v cn >/dev/null 2>&1; then
       installed="$(cn --version 2>/dev/null | tr -d '[:space:]' || true)"
       if [ "$installed" = "$version" ]; then

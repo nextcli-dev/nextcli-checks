@@ -49,6 +49,16 @@ fi
 if [ -n "${CHECKS_MAX_TURNS:-}" ] && [ "$CHECKS_MAX_TURNS" != "0" ]; then
   args+=(--max-turns "$CHECKS_MAX_TURNS")
 fi
+# At --max-time the agent gives a final answer and exits 3 too. cn before
+# 0.13.0 has no --max-time and would reject it, so look for it in the help
+# first. (Not `cn --help | grep -q`: with pipefail, grep closing the pipe early
+# fails the test.)
+if [ -n "${CHECKS_MAX_TIME:-}" ]; then
+  cn_help="$(cn --help 2>/dev/null || true)"
+  case "$cn_help" in
+    *"--max-time <"*) args+=(--max-time "$CHECKS_MAX_TIME") ;;
+  esac
+fi
 
 # Not exec: the trap must remove the config file when cn exits.
 set +e
