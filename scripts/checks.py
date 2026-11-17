@@ -1282,22 +1282,48 @@ def finding_location(finding: dict, repo: str, sha: str) -> str:
     return f"[{label_md}]({url})"
 
 
+CATALOG_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _price_note(usages: list) -> str:
+    """Where the prices behind a cost came from, as NextCLI reports them in
+    `priced`: " (estimated)" when any price is a guess (estimated, fallback, or
+    a value this script doesn't know), " (catalog price)" when the prices are
+    the host's own list prices from the models.dev snapshot, and nothing when
+    they are exact. Adds the oldest snapshot date NextCLI reports
+    (`catalogDate`), so a reader can tell how old the prices are."""
+    usages = [usage for usage in usages if isinstance(usage, dict)]
+    sources = [usage.get("priced") for usage in usages if usage.get("priced") not in (None, "exact")]
+    parts = []
+    if any(source != "catalog" for source in sources):
+        parts.append("estimated")
+    elif sources:
+        parts.append("catalog price")
+    dates = [
+        usage["catalogDate"]
+        for usage in usages
+        if isinstance(usage.get("catalogDate"), str) and CATALOG_DATE.fullmatch(usage["catalogDate"])
+    ]
+    if dates:
+        parts.append(f"models.dev {min(dates)}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def _format_cost(usage: dict | None) -> str:
     if not isinstance(usage, dict) or not isinstance(usage.get("cost"), (int, float)):
         return ""
-    cost = f"${usage['cost']:.2f}"
-    if usage.get("priced") not in (None, "exact"):
-        cost += " (estimated)"
-    return cost
+    return f"${usage['cost']:.2f}{_price_note([usage])}"
+
+
+LIMIT_NAMES = {"cost": "cost", "turns": "turn", "tokens": "token", "time": "time"}
 
 
 def partial_note(verdict: dict) -> str:
     if verdict.get("verdict") != "INCOMPLETE" and verdict.get("complete") is not False:
         return ""
-    if verdict.get("limit") == "cost":
-        why = "It reached its cost limit before it finished"
-    elif verdict.get("limit") in ("turns", "tokens"):
-        why = f"It reached its {verdict['limit'].rstrip('s')} limit before it finished"
+    limit = LIMIT_NAMES.get(verdict.get("limit"))
+    if limit:
+        why = f"It reached its {limit} limit before it finished"
     else:
         why = "The agent did not finish"
     return f"> **Partial review.** {why}. The findings cover only what it checked.\n"
@@ -1346,10 +1372,7 @@ def render_comment(
     costs = [v.get("usage", {}).get("cost") for _n, v in results if isinstance(v.get("usage"), dict)]
     costs = [c for c in costs if isinstance(c, (int, float))]
     if costs:
-        estimated = any(
-            (v.get("usage") or {}).get("priced") not in (None, "exact") for _n, v in results
-        )
-        cost = f"cost ${sum(costs):.2f}{' (estimated)' if estimated else ''}"
+        cost = f"cost ${sum(costs):.2f}{_price_note([v.get('usage') for _n, v in results])}"
         if max_cost:
             cost += f", limit ${float(max_cost):.2f} per check"
         facts.append(cost)
@@ -1598,6 +1621,8 @@ def limit_message(run_summary: dict | None, max_cost: str, max_turns: str) -> st
         what = f"its turn limit ({max_turns} model calls)" if max_turns else "its turn limit"
     elif limit == "tokens":
         what = "its token limit"
+    elif limit == "time":
+        what = "its time limit"
     else:
         what = "a limit"
     return f"The agent stopped at {what} before it returned a result."

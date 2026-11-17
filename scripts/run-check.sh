@@ -105,6 +105,13 @@ time_for_retry() {
 SECONDS_PER_TURN=20
 MAX_DERIVED_TURNS=60
 
+# NextCLI's --max-time is the time left minus this margin. cn still makes its
+# final call after the deadline, so the margin leaves room for that call and
+# the verdict before `timeout` stops the agent. A compaction just before the
+# final call can still run past it on a short check. The retry, which starts
+# with at least MIN_RETRY_SECONDS left, gets its own shorter --max-time.
+MAX_TIME_MARGIN=60
+
 run_agent() {
   local seconds_left=$((deadline - SECONDS))
   if [ "$seconds_left" -lt 1 ]; then
@@ -133,13 +140,19 @@ run_agent() {
       max_turns=1
     fi
   fi
+  # At least 1: with a 1-minute timeout, cn's first call is its final answer,
+  # without tools, and the review is marked partial instead of timing out.
+  local max_time=$((seconds_left - MAX_TIME_MARGIN))
+  if [ "$max_time" -lt 1 ]; then
+    max_time=1
+  fi
   # The caller turns errexit off around this call. Don't touch it here: turning
   # it back on before the return below would exit the whole script on any
   # non-zero agent status (124 timeout, 3 limit, 2 bad configuration), before
   # a verdict is written.
   # The agent gets the provider key and nothing else secret: no GitHub token
   # and no Actions runtime tokens.
-  CHECKS_PROVIDER="$provider" CHECKS_MODEL="$model" CHECKS_TRACE_DIR="$trace_dir" CHECKS_MAX_TURNS="$max_turns" \
+  CHECKS_PROVIDER="$provider" CHECKS_MODEL="$model" CHECKS_TRACE_DIR="$trace_dir" CHECKS_MAX_TURNS="$max_turns" CHECKS_MAX_TIME="$max_time" \
     timeout "${seconds_left}s" \
     env -u GH_TOKEN -u GITHUB_TOKEN \
       -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL -u ACTIONS_RESULTS_URL -u ACTIONS_CACHE_URL \

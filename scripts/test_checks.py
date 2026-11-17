@@ -323,6 +323,9 @@ fi
 
 
 class InstallAgentTest(unittest.TestCase):
+    # The @nextcli/cli version install-agent.sh installs by default.
+    DEFAULT_NEXTCLI = "0.13.0"
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -364,24 +367,24 @@ class InstallAgentTest(unittest.TestCase):
 
     def test_default_version_is_pinned(self):
         result, calls = self.run_install()
-        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.8.1"])
-        self.assertEqual(result.stdout.strip(), "0.8.1")
+        self.assertEqual(calls, [f"npm install -g @nextcli/cli@{self.DEFAULT_NEXTCLI}"])
+        self.assertEqual(result.stdout.strip(), self.DEFAULT_NEXTCLI)
 
     def test_agent_version_pins_nextcli(self):
         _, calls = self.run_install(CHECKS_AGENT_VERSION="0.2.0")
         self.assertEqual(calls, ["npm install -g @nextcli/cli@0.2.0"])
 
     def test_matching_installed_cn_is_kept(self):
-        self.install_cn("0.8.1")
+        self.install_cn(self.DEFAULT_NEXTCLI)
         result, calls = self.run_install()
         self.assertEqual(calls, [])
-        self.assertEqual(result.stdout.strip(), "0.8.1")
+        self.assertEqual(result.stdout.strip(), self.DEFAULT_NEXTCLI)
 
     def test_mismatched_installed_cn_is_reinstalled(self):
         self.install_cn("0.1.0")
         result, calls = self.run_install()
-        self.assertEqual(calls, ["npm install -g @nextcli/cli@0.8.1"])
-        self.assertEqual(result.stdout.strip(), "0.8.1")
+        self.assertEqual(calls, [f"npm install -g @nextcli/cli@{self.DEFAULT_NEXTCLI}"])
+        self.assertEqual(result.stdout.strip(), self.DEFAULT_NEXTCLI)
 
     def test_commit_sha_ref_is_fetched(self):
         sha = "0123456789abcdef0123456789abcdef01234567"
@@ -450,6 +453,56 @@ class CommentAndLimitTest(unittest.TestCase):
         self.assertIn("`keep@code`", body)
         self.assertIn("cost $0.40", body)
         self.assertIn("limit $1.00 per check", body)
+
+    def test_cost_says_where_its_prices_came_from(self):
+        cost = lambda **usage: checks._format_cost({"cost": 0.4, **usage})  # noqa: E731
+        self.assertEqual(cost(priced="exact"), "$0.40")
+        self.assertEqual(cost(), "$0.40")
+        self.assertEqual(
+            cost(priced="catalog", catalogDate="2026-11-15"), "$0.40 (catalog price, models.dev 2026-11-15)"
+        )
+        self.assertEqual(
+            cost(priced="estimated", catalogDate="2026-11-15"), "$0.40 (estimated, models.dev 2026-11-15)"
+        )
+        self.assertEqual(cost(priced="fallback"), "$0.40 (estimated)")
+        self.assertEqual(cost(priced="something-new"), "$0.40 (estimated)")
+        # The date is posted in the comment, so only a date is shown.
+        self.assertEqual(cost(priced="catalog", catalogDate="[x](https://e.test)"), "$0.40 (catalog price)")
+        self.assertEqual(cost(priced=["catalog"]), "$0.40 (estimated)")
+
+    def test_comment_cost_takes_the_least_exact_price_and_the_oldest_date(self):
+        def comment(*usages):
+            results = [(f"c{i}", {"verdict": "PASS", "summary": "s", "usage": u}) for i, u in enumerate(usages)]
+            return checks.render_comment(results, "o/r", "abc1234", "2")
+
+        catalog = {"cost": 0.3, "priced": "catalog", "catalogDate": "2026-11-15"}
+        older = {"cost": 0.1, "priced": "catalog", "catalogDate": "2026-11-08"}
+        estimated = {"cost": 0.2, "priced": "estimated"}
+        exact = {"cost": 0.4, "priced": "exact"}
+        self.assertIn("cost $0.40, limit $2.00 per check", comment(exact))
+        self.assertIn("cost $0.70 (catalog price, models.dev 2026-11-15), limit $2.00", comment(catalog, exact))
+        self.assertIn("cost $0.40 (catalog price, models.dev 2026-11-08)", comment(catalog, older))
+        self.assertIn("cost $0.50 (estimated, models.dev 2026-11-15)", comment(catalog, estimated))
+        # One check's cost line in the check run says the same
+        body = checks.check_run_body({"verdict": "PASS", "summary": "s", "usage": catalog}, "success", "")
+        self.assertIn("Cost: $0.30 (catalog price, models.dev 2026-11-15)", body["output"]["summary"])
+
+    def test_time_limit_is_named_in_the_partial_note_and_the_limit_message(self):
+        summary = checks.read_run_summary('{"status":"limit","limit":"time","usage":{"cost":0.5}}\n')
+        annotated = checks.annotate_verdict(
+            {"verdict": "PASS", "summary": "fine so far", "complete": True, "findings": []}, summary, True
+        )
+        self.assertEqual(annotated["limit"], "time")
+        self.assertFalse(annotated["complete"])
+        self.assertIn("It reached its time limit before it finished", checks.partial_note(annotated))
+        self.assertEqual(
+            checks.limit_message(summary, "2", ""),
+            "The agent stopped at its time limit before it returned a result.",
+        )
+        # The other limits keep their wording
+        self.assertIn("its turn limit", checks.partial_note({"verdict": "INCOMPLETE", "limit": "turns"}))
+        self.assertIn("its token limit", checks.partial_note({"verdict": "INCOMPLETE", "limit": "tokens"}))
+        self.assertIn("did not finish", checks.partial_note({"verdict": "INCOMPLETE"}))
 
     def test_render_comment_truncates(self):
         body = checks.render_comment(
@@ -887,9 +940,13 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(json.loads(self.verdict.read_text())["verdict"], "SKIP")
 
     def turns_given(self, timeout: str, max_turns: str | None) -> str:
-        record = self.root / "turns"
+        return self.limit_given("CHECKS_MAX_TURNS", timeout, max_turns)
+
+    def limit_given(self, variable: str, timeout: str, max_turns: str | None = None) -> str:
+        """The value of `variable` the agent is started with."""
+        record = self.root / "limit"
         agent = self.scripts / "agents" / "nextcli.sh"
-        agent.write_text(f"#!/usr/bin/env bash\necho \"$CHECKS_MAX_TURNS\" > '{record}'\nprintf '%s' '{self.VALID}'\n")
+        agent.write_text(f"#!/usr/bin/env bash\necho \"${variable}\" > '{record}'\nprintf '%s' '{self.VALID}'\n")
         env = {
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "HOME": str(self.root),
@@ -918,13 +975,60 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(self.turns_given("10", "45"), "45")
         self.assertEqual(self.turns_given("10", "0"), "0")
 
-    def run_sequence(self, runs, timeout="10", max_cost="2"):
+    def test_max_time_is_the_time_left_minus_a_minute(self):
+        # A second or two of setup comes off the time left.
+        self.assertIn(int(self.limit_given("CHECKS_MAX_TIME", "10")), range(537, 541))
+        self.assertIn(int(self.limit_given("CHECKS_MAX_TIME", "25")), range(1437, 1441))
+        # A 1-minute check leaves no margin: cn's first call is its answer.
+        self.assertEqual(self.limit_given("CHECKS_MAX_TIME", "1"), "1")
+
+    def test_a_retry_gets_the_time_left_of_the_same_limit(self):
+        times = self.root / "times"
+        result, verdict, limits = self.run_sequence(
+            [
+                (1, "", '{"status":"error","message":"boom","usage":{"cost":0.1}}'),
+                (0, self.VALID, '{"status":"done","limit":null,"usage":{"cost":0.2}}'),
+            ],
+            record_time=times,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(limits), 2)
+        first, retry = (int(value) for value in times.read_text().split())
+        self.assertIn(first, range(537, 541))
+        # The timeout shim doesn't wait, so both runs can start in the same second.
+        self.assertLessEqual(retry, first)
+
+    def test_time_limit_keeps_the_verdict_as_a_partial_review(self):
+        # Run 43834678832 was killed at its 25 minutes with no verdict. With
+        # --max-time, cn answers first and exits 3.
+        summary = '{"status":"limit","limit":"time","usage":{"cost":0.9}}'
+        result, verdict, limits = self.run_sequence([(3, self.VALID, summary)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(limits, ["2"])
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertFalse(verdict["complete"])
+        self.assertEqual(verdict["limit"], "time")
+        self.assertIn("time limit", checks.partial_note(verdict))
+
+    def test_time_limit_without_an_answer_names_the_time_limit(self):
+        result, verdict, _limits = self.run_sequence(
+            [(3, "", '{"status":"limit","limit":"time","usage":{"cost":0.4}}')]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verdict["verdict"], "INCOMPLETE")
+        self.assertIn("time limit", verdict["summary"])
+        self.assertIn("time limit", checks.partial_note(verdict))
+
+    def run_sequence(self, runs, timeout="10", max_cost="2", record_time=None):
         """An agent that behaves like runs[i] on its i-th run: (exit code,
         stdout, last stderr line). Returns the result, the verdict, and the
-        --max-cost each run got."""
+        --max-cost each run got. With record_time, each run's CHECKS_MAX_TIME
+        is appended to that file."""
         record = self.root / "runs"
         agent = self.scripts / "agents" / "nextcli.sh"
         lines = ["#!/usr/bin/env bash", f"echo \"$CHECKS_MAX_COST\" >> '{record}'", f"n=$(wc -l < '{record}' | tr -d ' ')"]
+        if record_time:
+            lines.append(f"echo \"$CHECKS_MAX_TIME\" >> '{record_time}'")
         for index, (code, stdout, stderr) in enumerate(runs, start=1):
             lines += [
                 f"if [ \"$n\" -eq {index} ]; then",
@@ -1741,7 +1845,10 @@ class InstallDepsTest(unittest.TestCase):
 
 
 class NextcliAgentArgsTest(unittest.TestCase):
-    """nextcli.sh passes the turn limit to cn."""
+    """nextcli.sh passes the turn and time limits to cn."""
+
+    HELP = "  --max-turns <n>          Model calls allowed in one run\n"
+    HELP_WITH_MAX_TIME = HELP + "  --max-time <seconds>     Seconds cn may run\n"
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1749,8 +1856,15 @@ class NextcliAgentArgsTest(unittest.TestCase):
         self.bin = root / "bin"
         self.bin.mkdir()
         self.args = root / "args"
+        self.help = root / "help"
+        self.help.write_text(self.HELP_WITH_MAX_TIME)
+        # A cn that prints self.help for --help and records any other call
         cn = self.bin / "cn"
-        cn.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > '{self.args}'\n")
+        cn.write_text(
+            "#!/usr/bin/env bash\n"
+            f"if [ \"$1\" = --help ]; then cat '{self.help}'; exit 0; fi\n"
+            f"printf '%s\\n' \"$@\" > '{self.args}'\n"
+        )
         cn.chmod(0o755)
         self.prompt = root / "prompt.md"
         self.prompt.write_text("Check.")
@@ -1758,7 +1872,7 @@ class NextcliAgentArgsTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_agent(self, max_turns: str) -> list[str]:
+    def run_agent(self, max_turns: str = "", max_time: str = "") -> list[str]:
         env = {
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "PROVIDER_API_KEY": "k",
@@ -1766,6 +1880,7 @@ class NextcliAgentArgsTest(unittest.TestCase):
             "CHECKS_MODEL": "m",
             "CHECKS_BASE_URL": "https://example.invalid/v1",
             "CHECKS_MAX_TURNS": max_turns,
+            "CHECKS_MAX_TIME": max_time,
         }
         result = subprocess.run(
             ["bash", str(Path(__file__).parent / "agents" / "nextcli.sh"), str(self.prompt)],
@@ -1781,6 +1896,22 @@ class NextcliAgentArgsTest(unittest.TestCase):
     def test_zero_turns_means_no_limit(self):
         self.assertNotIn("--max-turns", self.run_agent("0"))
         self.assertNotIn("--max-turns", self.run_agent(""))
+
+    def test_time_limit_is_passed_to_a_cn_that_has_it(self):
+        args = self.run_agent("30", "540")
+        self.assertEqual(args[args.index("--max-time") + 1], "540")
+        self.assertEqual(args[args.index("--max-turns") + 1], "30")
+        self.assertEqual(args[-1], "Check.")
+
+    def test_an_older_cn_runs_without_the_time_limit(self):
+        # cn before 0.13.0 has no --max-time and would reject it.
+        self.help.write_text(self.HELP)
+        args = self.run_agent("30", "540")
+        self.assertNotIn("--max-time", args)
+        self.assertEqual(args[args.index("--max-turns") + 1], "30")
+
+    def test_no_time_limit_without_a_value(self):
+        self.assertNotIn("--max-time", self.run_agent("30", ""))
 
 
 class ReportRetryTest(unittest.TestCase):
