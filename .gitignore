@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Claude Code: .claude/ is committed except personal settings and worktrees
+.claude/settings.local.json
+.claude/worktrees/
