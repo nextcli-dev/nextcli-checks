@@ -42,6 +42,19 @@ fi
 # --readonly in headless mode: read, search and list only. No shell, no MCP
 # tools and no Fetch. At --max-cost the agent gives a final answer and exits 3.
 args=(-p --format json --readonly --config "$config")
+# --format json tells the model to answer with "properties relevant to the
+# question" in the system message, on every turn. The verdict schema goes in
+# the system message too, as a rule, so a long review doesn't drift to keys of
+# its own. The prompt holds the schema as well.
+answer_format="$(cd "$script_dir/.." && pwd)/answer-format.md"
+if [ -f "$answer_format" ]; then
+  args+=(--rule "$answer_format")
+fi
+# A repair: continue the session of a run that answered without a verdict.
+# --fork copies it into a new session, so the first one stays as it was.
+if [ -n "${CHECKS_FORK_SESSION:-}" ]; then
+  args+=(--fork "$CHECKS_FORK_SESSION")
+fi
 if [ -n "${CHECKS_MAX_COST:-}" ]; then
   args+=(--max-cost "$CHECKS_MAX_COST")
 fi

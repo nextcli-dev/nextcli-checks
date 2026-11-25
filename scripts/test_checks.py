@@ -603,6 +603,30 @@ class CommentAndLimitTest(unittest.TestCase):
         self.assertIn("finished without writing an answer", annotated["summary"])
         self.assertEqual(annotated["usage"]["cost"], 0.8)
 
+    def test_an_answer_without_a_verdict_names_its_keys(self):
+        # Run 45583058682: a long review answered {"findings": [...], "notes": [...]}.
+        summary = {"status": "done", "limit": None, "usage": {"cost": 0.6}}
+        answer = json.dumps({"findings": [{"severity": "critical"}], "notes": ["n"]})
+        annotated = checks.annotate_verdict(self._no_verdict(), summary, False, 0.0, answer)
+        self.assertIn('JSON without a "verdict" key (keys: findings, notes)', annotated["summary"])
+        self.assertNotIn("without writing an answer", annotated["summary"])
+
+    def test_an_answer_that_is_not_json_is_quoted(self):
+        # Run 45620098793: the provider cut the stream and sent the model's
+        # thinking as its answer, which cn wrapped.
+        raw = json.dumps({
+            "response": "Let me think about it.\n" + "x" * 500,
+            "status": "success",
+            "note": "Response was not valid JSON, so it was wrapped in a JSON object",
+        })
+        detail = checks._error_detail({"status": "done"}, checks.answer_text(raw))
+        self.assertTrue(detail.startswith('Its answer was not JSON: "Let me think about it. xxx'), detail)
+        self.assertLess(len(detail), 200)
+
+    def test_a_verdict_the_check_cannot_use_is_named(self):
+        self.assertIn('"NEEDS_WORK", not PASS or FAIL', checks.answer_problem('{"verdict": "NEEDS_WORK"}'))
+        self.assertIn('"findings" was not a list', checks.answer_problem('{"verdict": "pass", "findings": {}}'))
+
     def test_a_long_error_message_is_cut(self):
         summary = {"status": "error", "message": "x" * 5000}
         annotated = checks.annotate_verdict(self._no_verdict(), summary, False)
@@ -692,6 +716,14 @@ class SessionReportTest(unittest.TestCase):
         self.assertIn("Run 2 (retry): 1 model calls (0 discarded)", report)
         self.assertIn("3 model calls (1 discarded)", report.splitlines()[0])
 
+    def test_names_a_repair(self):
+        repair = [_header(200, "r2"), _event(201, model="m", usage={"prompt_tokens": 5, "completion_tokens": 5},
+                                             costUsd=0.02, finishReason="stop", contentChars=40)]
+        runs = self._runs(self.CUT_OFF_RUN + repair)
+        self.assertIn("Run 2 (repair): 1 model calls", checks.session_report(runs, None, ["first", "repair"]))
+        # A run that wrote no trace would shift the names, so they are not used.
+        self.assertIn("Run 2 (retry): 1 model calls", checks.session_report(runs, None, ["first", "repair", "retry"]))
+
     def test_tells_an_empty_reply_after_thinking_from_a_truly_empty_one(self):
         thinking = _event(2, model="m", usage={"prompt_tokens": 9, "completion_tokens": 820,
                                                "completion_tokens_details": {"reasoning_tokens": 800}},
@@ -774,6 +806,12 @@ class RetryBudgetTest(unittest.TestCase):
 
     def test_no_retry_when_little_is_left(self):
         self.assertIsNone(checks.retry_budget({"status": "error", "usage": {"cost": 1.9}}, 2.0))
+
+    def test_counts_what_the_earlier_runs_spent(self):
+        remaining, spent = checks.retry_budget({"status": "done", "usage": {"cost": 0.3}}, 2.0, 0.5)
+        self.assertAlmostEqual(remaining, 1.2)
+        self.assertAlmostEqual(spent, 0.8)
+        self.assertIsNone(checks.retry_budget({"status": "done", "usage": {"cost": 0.3}}, 2.0, 1.6))
 
     def test_command_rounds_the_budget_down(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1185,6 +1223,139 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "ERROR")
         self.assertIn("finished without writing an answer", verdict["summary"])
 
+    # Runs 45020376529 and 45583058682: long reviews answered with keys of
+    # their own, so the check had no verdict.
+    OFF_SCHEMA = json.dumps({"findings": [{"severity": "high", "file": "a.ts"}], "notes": ["n"]})
+    FOUND = json.dumps(
+        {"verdict": "FAIL", "summary": "found one", "complete": True,
+         "findings": [{"file": "a.ts", "title": "Bug", "details": "x"}]}
+    )
+
+    @staticmethod
+    def done(cost: float) -> str:
+        return '{"status":"done","limit":null,"usage":{"cost":%s}}' % cost
+
+    def run_with_sessions(self, runs, timeout="10", save_session=True):
+        """Like run_sequence, and the N-th run saves the NextCLI session sN.
+        Returns the result, the verdict, and for each run its --max-cost, the
+        session it forked and the first line of its prompt."""
+        record = self.root / "runs"
+        sessions = self.root / ".continue" / "sessions"
+        agent = self.scripts / "agents" / "nextcli.sh"
+        lines = [
+            "#!/usr/bin/env bash",
+            f"printf '%s|%s|%s\\n' \"$CHECKS_MAX_COST\" \"${{CHECKS_FORK_SESSION:-}}\" \"$(head -n 1 \"$1\")\" >> '{record}'",
+            f"n=$(wc -l < '{record}' | tr -d ' ')",
+        ]
+        if save_session:
+            lines += [f"mkdir -p '{sessions}'", f"echo '{{}}' > '{sessions}/s'\"$n\".json"]
+        for index, (code, stdout, stderr) in enumerate(runs, start=1):
+            lines += [
+                f"if [ \"$n\" -eq {index} ]; then",
+                f"  printf '%s' '{stdout}'",
+                f"  echo '{stderr}' >&2",
+                f"  exit {code}",
+                "fi",
+            ]
+        lines.append("exit 1")
+        agent.write_text("\n".join(lines) + "\n")
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "CHECKS_AGENT": "nextcli",
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "CHECKS_MAX_COST": "2",
+            "CHECKS_TIMEOUT": timeout,
+        }
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
+            env=env, capture_output=True, text=True,
+        )
+        calls = [line.split("|") for line in record.read_text().splitlines()]
+        return result, json.loads(self.verdict.read_text()), calls
+
+    def kept(self, suffix: str) -> Path:
+        return Path(f"/tmp/check-{self.NAME}.{suffix}")
+
+    def test_an_answer_without_a_verdict_is_repaired_in_its_own_session(self):
+        result, verdict, calls = self.run_with_sessions([
+            (0, self.OFF_SCHEMA, self.done(0.5)),
+            (0, self.FOUND, self.done(0.05)),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[0] for call in calls], ["2", "1.5000"])
+        self.assertEqual([call[1] for call in calls], ["", "s1"])
+        self.assertTrue(calls[1][2].startswith("Your last answer was not the JSON object"), calls[1][2])
+        self.assertIn("asking the same session", result.stdout)
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertAlmostEqual(verdict["usage"]["cost"], 0.55)
+        # The first answer and its session stay with the results.
+        self.assertEqual(self.kept("run1.json").read_text(), self.OFF_SCHEMA)
+        self.assertTrue(self.kept("run1.session.json").is_file())
+        self.assertTrue(self.kept("session.json").is_file())
+
+    def test_a_failed_repair_is_retried_with_what_both_runs_left(self):
+        result, verdict, calls = self.run_with_sessions([
+            (0, self.OFF_SCHEMA, self.done(0.5)),
+            (0, self.OFF_SCHEMA, self.done(0.3)),
+            (0, self.FOUND, self.done(0.2)),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[0] for call in calls], ["2", "1.5000", "1.2000"])
+        self.assertEqual([call[1] for call in calls], ["", "s1", ""])
+        self.assertTrue(calls[2][2].startswith("You are running a quality check"))
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertAlmostEqual(verdict["usage"]["cost"], 1.0)
+        self.assertTrue(self.kept("run1.json").is_file())
+        self.assertTrue(self.kept("run2.json").is_file())
+
+    def test_when_no_run_gives_a_verdict_the_error_says_what_the_answer_was(self):
+        result, verdict, calls = self.run_with_sessions([
+            (0, self.OFF_SCHEMA, self.done(0.5)),
+            (0, self.OFF_SCHEMA, self.done(0.3)),
+            (0, self.OFF_SCHEMA, self.done(0.2)),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(verdict["verdict"], "ERROR")
+        self.assertIn('JSON without a "verdict" key (keys: findings, notes)', verdict["summary"])
+        self.assertNotIn("without writing an answer", verdict["summary"])
+
+    def test_no_repair_without_a_session_of_its_own(self):
+        # An earlier check in the same job saved this one.
+        sessions = self.root / ".continue" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "earlier.json").write_text("{}")
+        result, verdict, calls = self.run_with_sessions(
+            [(0, self.OFF_SCHEMA, self.done(0.5)), (0, self.FOUND, self.done(0.3))],
+            save_session=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[1] for call in calls], ["", ""])
+        self.assertTrue(calls[1][2].startswith("You are running a quality check"))
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertFalse(self.kept("session.json").exists())
+
+    def test_an_error_is_retried_not_repaired(self):
+        result, verdict, calls = self.run_with_sessions([
+            (1, "", '{"status":"error","message":"boom","usage":{"cost":0.5}}'),
+            (0, self.FOUND, self.done(0.3)),
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[1] for call in calls], ["", ""])
+        self.assertEqual(verdict["verdict"], "FAIL")
+
+    def test_no_repair_with_too_little_time_left(self):
+        # A 1-minute limit is under the 2 minutes a repair needs.
+        result, verdict, calls = self.run_with_sessions(
+            [(0, self.OFF_SCHEMA, self.done(0.5))], timeout="1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("left to ask for one", result.stdout)
+        self.assertEqual(verdict["verdict"], "ERROR")
+
 
 class DepsPlanTest(unittest.TestCase):
     def setUp(self):
@@ -1583,6 +1754,17 @@ class DepsPlanTest(unittest.TestCase):
         self.assertIn("+ @@CHECK_BODY@@ in a diff", text)
         self.assertEqual(text.count("CHECK BODY"), 1)
 
+    def test_the_answer_format_ends_the_prompt_and_is_the_repair(self):
+        text = checks.render_prompt("CHECK BODY", "+ @@ANSWER_FORMAT@@ in a diff")
+        self.assertIn("+ @@ANSWER_FORMAT@@ in a diff", text)
+        self.assertEqual(text.count('"verdict": "PASS" or "FAIL"'), 1)
+        self.assertTrue(text.endswith("A PASS verdict must have an empty findings array.\n"), text[-200:])
+        repair = checks.render_prompt("CHECK BODY", "diff --git a/x b/x", repair=True)
+        self.assertNotIn("diff --git", repair)
+        self.assertNotIn("CHECK BODY", repair)
+        self.assertIn('"verdict": "PASS" or "FAIL"', repair)
+        self.assertIn("Do not read more files", repair)
+
 
 class InstallWantedTest(unittest.TestCase):
     """Dependencies are installed only for a check that runs its agent and wants them."""
@@ -1872,7 +2054,7 @@ class NextcliAgentArgsTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_agent(self, max_turns: str = "", max_time: str = "") -> list[str]:
+    def run_agent(self, max_turns: str = "", max_time: str = "", fork: str = "") -> list[str]:
         env = {
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "PROVIDER_API_KEY": "k",
@@ -1881,6 +2063,7 @@ class NextcliAgentArgsTest(unittest.TestCase):
             "CHECKS_BASE_URL": "https://example.invalid/v1",
             "CHECKS_MAX_TURNS": max_turns,
             "CHECKS_MAX_TIME": max_time,
+            "CHECKS_FORK_SESSION": fork,
         }
         result = subprocess.run(
             ["bash", str(Path(__file__).parent / "agents" / "nextcli.sh"), str(self.prompt)],
@@ -1912,6 +2095,20 @@ class NextcliAgentArgsTest(unittest.TestCase):
 
     def test_no_time_limit_without_a_value(self):
         self.assertNotIn("--max-time", self.run_agent("30", ""))
+
+    def test_the_answer_format_is_a_rule(self):
+        # So the schema stays in the system message next to --format json's
+        # "properties relevant to the question".
+        args = self.run_agent("30")
+        rule = Path(args[args.index("--rule") + 1])
+        self.assertTrue(rule.is_absolute())
+        self.assertIn('"verdict": "PASS" or "FAIL"', rule.read_text())
+
+    def test_a_repair_forks_the_session(self):
+        self.assertNotIn("--fork", self.run_agent("30"))
+        args = self.run_agent("30", fork="s1")
+        self.assertEqual(args[args.index("--fork") + 1], "s1")
+        self.assertEqual(args[-1], "Check.")
 
 
 class ReportRetryTest(unittest.TestCase):

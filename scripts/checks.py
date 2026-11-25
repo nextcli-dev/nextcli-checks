@@ -143,21 +143,45 @@ def yaml_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+def answer_format() -> str:
+    """The verdict schema and its rules. The prompt ends with it, and nextcli.sh
+    also gives it to cn as a rule, so it stays in the system message on every
+    turn next to cn's own `--format json` instructions."""
+    return (SCRIPT_DIR / "answer-format.md").read_text().rstrip("\n")
+
+
+# Sent to the agent's own session when it answered without a verdict, so the
+# review it already did is written down instead of done again.
+REPAIR_PROMPT = (
+    "Your last answer was not the JSON object this check needs, so it was discarded. "
+    "Write your answer again as that object, from the review you have done. "
+    "Do not read more files.\n\n"
+)
+
+
 def render_prompt(
     check_body: str,
     diff: str,
     retry: bool = False,
     empty_review: bool = False,
     dependencies: str = "",
+    repair: bool = False,
 ) -> str:
+    if repair:
+        return REPAIR_PROMPT + answer_format() + "\n"
     template = (SCRIPT_DIR / "prompt.md").read_text()
     values = {
         "PR_DIFF": diff,
         "DEPENDENCIES": dependencies or render_dependencies([]),
         "CHECK_BODY": check_body,
+        "ANSWER_FORMAT": answer_format(),
     }
     # One pass, so a placeholder written inside the diff is left as text.
-    text = re.sub(r"@@(PR_DIFF|DEPENDENCIES|CHECK_BODY)@@", lambda m: values[m.group(1)], template)
+    text = re.sub(
+        r"@@(PR_DIFF|DEPENDENCIES|CHECK_BODY|ANSWER_FORMAT)@@",
+        lambda m: values[m.group(1)],
+        template,
+    )
     if empty_review:
         text += (
             "\n\nYour previous response did not review the diff in this prompt. "
@@ -1453,10 +1477,46 @@ def read_run_summary(stderr_text: str) -> dict | None:
 
 
 ERROR_DETAIL_LIMIT = 500
+# How much of an answer that isn't JSON the error quotes
+ANSWER_QUOTE_LIMIT = 160
+ANSWER_KEYS_SHOWN = 6
 
 
-def _error_detail(run_summary: dict | None) -> str:
-    """Why an agent run gave no verdict, from its last stderr line."""
+def answer_text(raw: str) -> str:
+    """The agent's answer on stdout. `cn --format json` wraps an answer that is
+    not JSON in {"response": ..., "status": ..., "note": ...}; that is unwrapped."""
+    raw = raw.strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if isinstance(parsed, dict) and "note" in parsed and isinstance(parsed.get("response"), str):
+        return parsed["response"].strip()
+    return raw
+
+
+def answer_problem(answer: str) -> str:
+    """What is wrong with an answer that parse_verdict found no verdict in."""
+    objects = [obj for obj in _balanced_objects(_strip_fences(answer)) if isinstance(obj, dict)]
+    if not objects:
+        quote = " ".join(answer.split())
+        if len(quote) > ANSWER_QUOTE_LIMIT:
+            quote = quote[: ANSWER_QUOTE_LIMIT - 1].rstrip() + "…"
+        return f'Its answer was not JSON: "{quote}"'
+    largest = max(objects, key=lambda obj: len(json.dumps(obj)))
+    if "verdict" not in largest:
+        keys = list(largest)[:ANSWER_KEYS_SHOWN]
+        more = ", …" if len(largest) > ANSWER_KEYS_SHOWN else ""
+        return f'Its answer was JSON without a "verdict" key (keys: {", ".join(keys)}{more}).'
+    verdict = largest["verdict"]
+    if isinstance(verdict, str) and verdict.strip().upper() in ("PASS", "FAIL"):
+        return 'Its answer\'s "findings" was not a list.'
+    return f'Its answer\'s "verdict" was {json.dumps(verdict)[:40]}, not PASS or FAIL.'
+
+
+def _error_detail(run_summary: dict | None, answer: str = "") -> str:
+    """Why an agent run gave no verdict, from its last stderr line and, for a
+    run that finished, its answer."""
     if not run_summary:
         return ""
     status = run_summary.get("status")
@@ -1466,6 +1526,8 @@ def _error_detail(run_summary: dict | None) -> str:
             return f"The agent stopped with an error: {_fit(message, ERROR_DETAIL_LIMIT)}"
         return "The agent stopped with an error."
     if status == "done":
+        if answer.strip():
+            return answer_problem(answer)
         return "The agent finished without writing an answer."
     return ""
 
@@ -1475,10 +1537,12 @@ def annotate_verdict(
     run_summary: dict | None,
     limit_exit: bool,
     spent_before: float = 0.0,
+    answer: str = "",
 ) -> dict:
     """Adds the agent's usage, says why an ERROR verdict has no result, and
-    marks a run ended by a limit as partial. `spent_before` is what an earlier
-    run of the same check cost, so the reported cost covers both runs."""
+    marks a run ended by a limit as partial. `spent_before` is what the earlier
+    runs of the same check cost, so the reported cost covers all of them.
+    `answer` is what the last run wrote, for an ERROR verdict's reason."""
     annotated = dict(verdict)
     limit = None
     if run_summary:
@@ -1489,7 +1553,7 @@ def annotate_verdict(
                 usage["cost"] = round(cost + spent_before, 6)
             annotated["usage"] = usage
         limit = run_summary.get("limit")
-    detail = _error_detail(run_summary)
+    detail = _error_detail(run_summary, answer)
     if annotated.get("verdict") == "ERROR" and detail:
         annotated["summary"] = f"{annotated.get('summary') or ''} {detail}".strip()
     if limit_exit or limit:
@@ -1607,6 +1671,7 @@ def cmd_render_prompt(args: argparse.Namespace) -> int:
             retry=args.retry,
             empty_review=args.retry_empty,
             dependencies=dependencies,
+            repair=args.repair,
         )
     )
     return 0
@@ -1753,8 +1818,11 @@ def cmd_annotate(args: argparse.Namespace) -> int:
     stderr_text = ""
     if args.stderr and Path(args.stderr).is_file():
         stderr_text = Path(args.stderr).read_text(errors="replace")
+    answer = ""
+    if args.answer and Path(args.answer).is_file():
+        answer = answer_text(Path(args.answer).read_text(errors="replace"))
     annotated = annotate_verdict(
-        verdict, read_run_summary(stderr_text), args.limit_exit, args.spent_before
+        verdict, read_run_summary(stderr_text), args.limit_exit, args.spent_before, answer
     )
     path.write_text(json.dumps(annotated))
     return 0
@@ -1873,19 +1941,23 @@ def run_ending(calls: list[dict]) -> str | None:
 RETRY_MIN_BUDGET_SHARE = 0.1
 
 
-def retry_budget(run_summary: dict | None, max_cost: float) -> tuple[float, float] | None:
-    """(budget left, spent) for a retry of a run with a cost limit, or None when
-    the first run's cost is unknown or too little of the limit is left."""
+def retry_budget(
+    run_summary: dict | None, max_cost: float, spent_before: float = 0.0
+) -> tuple[float, float] | None:
+    """(budget left, spent) for another run of a check with a cost limit, or
+    None when the last run's cost is unknown or too little of the limit is
+    left. `spent_before` is what the runs before the last one cost."""
     if not run_summary or max_cost <= 0:
         return None
     usage = run_summary.get("usage")
     cost = usage.get("cost") if isinstance(usage, dict) else None
     if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0:
         return None
-    remaining = max_cost - cost
+    spent = cost + max(spent_before, 0.0)
+    remaining = max_cost - spent
     if remaining < max_cost * RETRY_MIN_BUDGET_SHARE:
         return None
-    return remaining, float(cost)
+    return remaining, float(spent)
 
 
 def cmd_retry_budget(args: argparse.Namespace) -> int:
@@ -1896,7 +1968,7 @@ def cmd_retry_budget(args: argparse.Namespace) -> int:
         max_cost = float(args.max_cost)
     except ValueError:
         return 1
-    budget = retry_budget(read_run_summary(stderr_text), max_cost)
+    budget = retry_budget(read_run_summary(stderr_text), max_cost, args.spent_before)
     if budget is None:
         return 1
     remaining, spent = budget
@@ -1981,16 +2053,21 @@ def _call_row(index: int, call: dict) -> str:
     )
 
 
-def session_report(runs: list[dict], session: dict | None = None) -> str:
+def session_report(
+    runs: list[dict], session: dict | None = None, kinds: list[str] | None = None
+) -> str:
     """A per-call table for each run of one check, how each run ended, and
-    what the tools of the last run returned."""
+    what the tools of the last run returned. `kinds` names each run after the
+    first (repair, retry) when there is one name per run."""
     calls = [call for run in runs for call in run["calls"]]
     lines = [_totals(calls)]
+    named = kinds is not None and len(kinds) == len(runs)
     for number, run in enumerate(runs, 1):
         lines.append("")
         if len(runs) > 1:
-            retry = " (retry)" if number > 1 else ""
-            lines += [f"Run {number}{retry}: {_totals(run['calls'])}", ""]
+            kind = kinds[number - 1] if named else "retry"
+            label = f" ({kind})" if number > 1 else ""
+            lines += [f"Run {number}{label}: {_totals(run['calls'])}", ""]
         lines.append(CALL_TABLE_HEADER)
         lines += [_call_row(index, call) for index, call in enumerate(run["calls"], 1)]
         ending = run_ending(run["calls"])
@@ -2035,7 +2112,8 @@ def cmd_session_report(args: argparse.Namespace) -> int:
             session = loaded if isinstance(loaded, dict) else None
         except json.JSONDecodeError:
             session = None
-    sys.stdout.write(session_report(read_trace(calls_path), session))
+    kinds = [kind for kind in (args.kinds or "").split(",") if kind] or None
+    sys.stdout.write(session_report(read_trace(calls_path), session, kinds))
     return 0
 
 
@@ -2079,6 +2157,11 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--diff", required=True)
     render.add_argument("--retry", action="store_true")
     render.add_argument("--retry-empty", action="store_true")
+    render.add_argument(
+        "--repair",
+        action="store_true",
+        help="The short prompt that asks the agent's own session for its verdict again.",
+    )
     render.add_argument("--deps", help="install-deps.sh results: ecosystem, location, status per line")
     render.set_defaults(func=cmd_render_prompt)
 
@@ -2140,6 +2223,7 @@ def build_parser() -> argparse.ArgumentParser:
     annotate.add_argument("--stderr")
     annotate.add_argument("--limit-exit", action="store_true")
     annotate.add_argument("--spent-before", type=float, default=0.0)
+    annotate.add_argument("--answer", help="The last run's stdout, to say what its answer lacked.")
     annotate.set_defaults(func=cmd_annotate)
 
     budget = sub.add_parser(
@@ -2148,6 +2232,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     budget.add_argument("--stderr", required=True)
     budget.add_argument("--max-cost", required=True)
+    budget.add_argument(
+        "--spent-before",
+        type=float,
+        default=0.0,
+        help="What the runs before the one in --stderr cost.",
+    )
     budget.set_defaults(func=cmd_retry_budget)
 
     report = sub.add_parser(
@@ -2156,6 +2246,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.add_argument("--calls", required=True)
     report.add_argument("--session")
+    report.add_argument(
+        "--kinds",
+        help="Comma-separated kind of each run, oldest first (first,repair,retry).",
+    )
     report.set_defaults(func=cmd_session_report)
 
     redact = sub.add_parser(
