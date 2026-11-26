@@ -1495,14 +1495,19 @@ def answer_text(raw: str) -> str:
     return raw
 
 
+def _quote(answer: str) -> str:
+    """An answer on one line, cut to ANSWER_QUOTE_LIMIT characters."""
+    quote = " ".join(answer.split())
+    if len(quote) > ANSWER_QUOTE_LIMIT:
+        quote = quote[: ANSWER_QUOTE_LIMIT - 1].rstrip() + "…"
+    return quote
+
+
 def answer_problem(answer: str) -> str:
     """What is wrong with an answer that parse_verdict found no verdict in."""
     objects = [obj for obj in _balanced_objects(_strip_fences(answer)) if isinstance(obj, dict)]
     if not objects:
-        quote = " ".join(answer.split())
-        if len(quote) > ANSWER_QUOTE_LIMIT:
-            quote = quote[: ANSWER_QUOTE_LIMIT - 1].rstrip() + "…"
-        return f'Its answer was not JSON: "{quote}"'
+        return f'Its answer was not JSON: "{_quote(answer)}"'
     largest = max(objects, key=lambda obj: len(json.dumps(obj)))
     if "verdict" not in largest:
         keys = list(largest)[:ANSWER_KEYS_SHOWN]
@@ -1512,6 +1517,22 @@ def answer_problem(answer: str) -> str:
     if isinstance(verdict, str) and verdict.strip().upper() in ("PASS", "FAIL"):
         return 'Its answer\'s "findings" was not a list.'
     return f'Its answer\'s "verdict" was {json.dumps(verdict)[:40]}, not PASS or FAIL.'
+
+
+def provider_refused(run_summary: dict | None) -> bool:
+    """True when a finished NextCLI run's provider reported 0 prompt tokens.
+    A model that read the prompt counts it, and cn estimates the tokens of a
+    call whose provider sends no usage, so 0 means a gateway answered in the
+    model's place. Run 45731595637: a provider that blocked the runner's
+    network answered every check with HTTP 200, 0 prompt tokens and a
+    sentence of its own ("access is temporarily restricted, try again later")."""
+    if not run_summary or run_summary.get("status") != "done":
+        return False
+    usage = run_summary.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    prompt = usage.get("promptTokens")
+    return isinstance(prompt, int) and not isinstance(prompt, bool) and prompt == 0
 
 
 def _error_detail(run_summary: dict | None, answer: str = "") -> str:
@@ -1526,6 +1547,9 @@ def _error_detail(run_summary: dict | None, answer: str = "") -> str:
             return f"The agent stopped with an error: {_fit(message, ERROR_DETAIL_LIMIT)}"
         return "The agent stopped with an error."
     if status == "done":
+        if provider_refused(run_summary):
+            said = f': "{_quote(answer)}"' if answer.strip() else "."
+            return f"The provider answered with 0 prompt tokens, so the model never read the check{said}"
         if answer.strip():
             return answer_problem(answer)
         return "The agent finished without writing an answer."
@@ -1977,6 +2001,13 @@ def cmd_retry_budget(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_provider_refused(args: argparse.Namespace) -> int:
+    stderr_text = ""
+    if Path(args.stderr).is_file():
+        stderr_text = Path(args.stderr).read_text(errors="replace")
+    return 0 if provider_refused(read_run_summary(stderr_text)) else 1
+
+
 def _tool_results(session: dict) -> list[tuple[str, str, int]]:
     """(tool, main argument, characters returned) for each tool call."""
     results = []
@@ -2239,6 +2270,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="What the runs before the one in --stderr cost.",
     )
     budget.set_defaults(func=cmd_retry_budget)
+
+    refused = sub.add_parser(
+        "provider-refused",
+        help="Exit 0 when a NextCLI run finished with 0 prompt tokens: its provider answered without passing the prompt to the model.",
+    )
+    refused.add_argument("--stderr", required=True)
+    refused.set_defaults(func=cmd_provider_refused)
 
     report = sub.add_parser(
         "session-report",

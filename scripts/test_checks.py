@@ -623,6 +623,22 @@ class CommentAndLimitTest(unittest.TestCase):
         self.assertTrue(detail.startswith('Its answer was not JSON: "Let me think about it. xxx'), detail)
         self.assertLess(len(detail), 200)
 
+    def test_zero_prompt_tokens_is_a_provider_refusal(self):
+        # Run 45731595637: the provider blocked the network and answered itself.
+        refused = {"status": "done", "usage": {"cost": 0.0003, "promptTokens": 0, "completionTokens": 233}}
+        self.assertTrue(checks.provider_refused(refused))
+        self.assertFalse(checks.provider_refused({**refused, "status": "limit"}))
+        self.assertFalse(checks.provider_refused({**refused, "status": "error"}))
+        self.assertFalse(checks.provider_refused({"status": "done", "usage": {"cost": 0.1}}))
+        self.assertFalse(checks.provider_refused({"status": "done", "usage": {"promptTokens": 16272}}))
+        self.assertFalse(checks.provider_refused(None))
+        raw = json.dumps({"response": "当前网络的请求存在异常，已被临时限制访问，请稍后再试。", "status": "success", "note": "wrapped"})
+        detail = checks._error_detail(refused, checks.answer_text(raw))
+        self.assertEqual(
+            detail,
+            'The provider answered with 0 prompt tokens, so the model never read the check: "当前网络的请求存在异常，已被临时限制访问，请稍后再试。"',
+        )
+
     def test_a_verdict_the_check_cannot_use_is_named(self):
         self.assertIn('"NEEDS_WORK", not PASS or FAIL', checks.answer_problem('{"verdict": "NEEDS_WORK"}'))
         self.assertIn('"findings" was not a list', checks.answer_problem('{"verdict": "pass", "findings": {}}'))
@@ -1235,7 +1251,7 @@ class AgentExitCodeTest(unittest.TestCase):
     def done(cost: float) -> str:
         return '{"status":"done","limit":null,"usage":{"cost":%s}}' % cost
 
-    def run_with_sessions(self, runs, timeout="10", save_session=True):
+    def run_with_sessions(self, runs, timeout="10", save_session=True, extra_env=None):
         """Like run_sequence, and the N-th run saves the NextCLI session sN.
         Returns the result, the verdict, and for each run its --max-cost, the
         session it forked and the first line of its prompt."""
@@ -1267,6 +1283,7 @@ class AgentExitCodeTest(unittest.TestCase):
             "CHECKS_MODEL": "m",
             "CHECKS_MAX_COST": "2",
             "CHECKS_TIMEOUT": timeout,
+            **(extra_env or {}),
         }
         result = subprocess.run(
             ["bash", str(self.scripts / "run-check.sh"), str(self.check)],
@@ -1345,6 +1362,67 @@ class AgentExitCodeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([call[1] for call in calls], ["", ""])
         self.assertEqual(verdict["verdict"], "FAIL")
+
+    # Run 45731595637: a provider that blocked the runner's network answered
+    # with HTTP 200, 0 prompt tokens and a sentence of its own.
+    BLOCKED = "当前网络的请求存在异常，已被临时限制访问，请稍后再试。"
+    NO_WAIT = {"CHECKS_REFUSAL_DELAYS": "0 0 0"}
+
+    @staticmethod
+    def refused() -> str:
+        return '{"status":"done","limit":null,"usage":{"cost":0.0003,"promptTokens":0,"completionTokens":233}}'
+
+    def test_a_refused_run_runs_again_with_the_same_prompt(self):
+        result, verdict, calls = self.run_with_sessions(
+            [(0, self.BLOCKED, self.refused()), (0, self.FOUND, self.done(0.3))],
+            extra_env=self.NO_WAIT,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call[1] for call in calls], ["", ""])
+        self.assertTrue(calls[1][2].startswith("You are running a quality check"), calls[1][2])
+        self.assertEqual(calls[1][0], "1.9997")
+        self.assertIn("without passing the prompt to the model", result.stdout)
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertAlmostEqual(verdict["usage"]["cost"], 0.3003)
+        self.assertEqual(self.kept("run1.json").read_text(), self.BLOCKED)
+
+    def test_a_provider_that_refuses_every_run_is_an_error_that_quotes_it(self):
+        result, verdict, calls = self.run_with_sessions(
+            [(0, self.BLOCKED, self.refused())] * 5, extra_env=self.NO_WAIT
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The first run and one rerun per delay; no repair and no retry.
+        self.assertEqual(len(calls), 4)
+        self.assertEqual([call[1] for call in calls], ["", "", "", ""])
+        self.assertEqual(verdict["verdict"], "ERROR")
+        self.assertIn("in any of 4 runs", verdict["summary"])
+        self.assertIn("0 prompt tokens", verdict["summary"])
+        self.assertIn(self.BLOCKED, verdict["summary"])
+
+    def test_a_rerun_without_a_verdict_is_repaired(self):
+        result, verdict, calls = self.run_with_sessions(
+            [
+                (0, self.BLOCKED, self.refused()),
+                (0, self.OFF_SCHEMA, self.done(0.5)),
+                (0, self.FOUND, self.done(0.05)),
+            ],
+            extra_env=self.NO_WAIT,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[1] for call in calls], ["", "", "s2"])
+        self.assertEqual(verdict["verdict"], "FAIL")
+
+    def test_no_rerun_with_too_little_time_left(self):
+        result, verdict, calls = self.run_with_sessions(
+            [(0, self.BLOCKED, self.refused()), (0, self.FOUND, self.done(0.3))],
+            timeout="1", extra_env=self.NO_WAIT,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("to wait for its provider", result.stdout)
+        self.assertEqual(verdict["verdict"], "ERROR")
+        self.assertIn("did not pass the check to the model.", verdict["summary"])
 
     def test_no_repair_with_too_little_time_left(self):
         # A 1-minute limit is under the 2 minutes a repair needs.

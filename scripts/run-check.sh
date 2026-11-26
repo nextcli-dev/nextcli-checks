@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Run one check file. Path filters skip the agent and still publish a
 # successful check run, so a required status check does not stay pending.
-# A nextcli run that answered without a verdict is first asked for it in its
-# own session (a repair). A verdict that still fails to parse is retried once.
-# Configuration errors (exit 2) and timeouts are not retried, and neither is a
-# run that stopped at a limit (exit 3) but still gave a verdict: that verdict
-# is kept as a partial review. CHECKS_TIMEOUT covers the first run, a repair
-# and a retry together, so a check fits in the job's time limit.
+# A nextcli run whose provider answered without passing the prompt to the
+# model (0 prompt tokens) runs again after a wait. A nextcli run that answered
+# without a verdict is first asked for it in its own session (a repair). A
+# verdict that still fails to parse is retried once. Configuration errors
+# (exit 2) and timeouts are not retried, and neither is a run that stopped at
+# a limit (exit 3) but still gave a verdict: that verdict is kept as a partial
+# review. CHECKS_TIMEOUT covers the first run, its reruns, a repair and a
+# retry together, so a check fits in the job's time limit.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -297,7 +299,56 @@ run_agent
 code=$?
 set -e
 
-if ! judge_run "$code"; then
+# A nextcli run that finished with 0 prompt tokens never reached the model:
+# its provider answered in the model's place (checks.py provider-refused). In
+# run 45731595637 a provider blocked the runner's network for about half a
+# minute and answered three checks, and their retries 5-10 s later, with
+# "access is temporarily restricted, try again later". Wait and run the check
+# again, up to once per delay, instead of repairing or retrying an answer the
+# model never wrote. The waits come out of the check's time limit; the tests
+# set CHECKS_REFUSAL_DELAYS to skip them.
+read -r -a refusal_delays <<< "${CHECKS_REFUSAL_DELAYS:-30 60 120}"
+refused=false
+refusals=0
+while [ "$agent" = "nextcli" ] && [ "$code" -eq 0 ] &&
+  python3 "$script_dir/checks.py" provider-refused --stderr "$err"; do
+  refused=true
+  if [ "$refusals" -ge "${#refusal_delays[@]}" ]; then
+    break
+  fi
+  delay="${refusal_delays[$refusals]}"
+  if [ $((deadline - SECONDS - delay)) -lt "$MIN_RETRY_SECONDS" ]; then
+    echo "::notice::check/${name} has too little of its ${timeout_minutes} minutes left to wait for its provider."
+    break
+  fi
+  rerun_max_cost=""
+  if [ -n "${CHECKS_MAX_COST:-}" ]; then
+    if ! budget="$(python3 "$script_dir/checks.py" retry-budget --stderr "$err" --max-cost "$CHECKS_MAX_COST" --spent-before "$spent_before")"; then
+      echo "::notice::check/${name} has too little of its \$${CHECKS_MAX_COST} cost limit left to run again."
+      break
+    fi
+    read -r rerun_max_cost spent_before <<< "$budget"
+  fi
+  refusals=$((refusals + 1))
+  echo "::notice::check/${name}: the provider answered without passing the prompt to the model; running the check again in ${delay} s."
+  keep_run
+  run_kinds+=(rerun)
+  sleep "$delay"
+  refused=false
+  set +e
+  CHECKS_MAX_COST="$rerun_max_cost" run_agent
+  code=$?
+  set -e
+done
+
+if [ "$refused" = true ]; then
+  # annotate adds the provider's answer.
+  if [ "${#run_kinds[@]}" -eq 1 ]; then
+    write_error_verdict "The provider did not pass the check to the model."
+  else
+    write_error_verdict "The provider did not pass the check to the model in any of ${#run_kinds[@]} runs."
+  fi
+elif ! judge_run "$code"; then
   if [ "$review_was_empty" != true ] && repair_answer "$code"; then
     : # The session wrote its review as a verdict.
   elif [ "$review_was_empty" = true ]; then
