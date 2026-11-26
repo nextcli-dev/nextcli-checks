@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Run one check file. Path filters skip the agent and still publish a
 # successful check run, so a required status check does not stay pending.
-# A verdict that fails to parse is retried once. Configuration errors (exit 2)
-# and timeouts are not retried, and neither is a run that stopped at a limit
-# (exit 3) but still gave a verdict: that verdict is kept as a partial review.
-# CHECKS_TIMEOUT covers the first run and its retry together, so a check fits
-# in the job's time limit.
+# A nextcli run that answered without a verdict is first asked for it in its
+# own session (a repair). A verdict that still fails to parse is retried once.
+# Configuration errors (exit 2) and timeouts are not retried, and neither is a
+# run that stopped at a limit (exit 3) but still gave a verdict: that verdict
+# is kept as a partial review. CHECKS_TIMEOUT covers the first run, a repair
+# and a retry together, so a check fits in the job's time limit.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,6 +43,10 @@ trace_dir="/tmp/check-${name}.traces"
 : > "$err"
 rm -rf "$trace_dir"
 mkdir -p "$trace_dir"
+# NextCLI saves each run as a new <session id>.json here. The names there
+# before a run starts tell its own session apart from an earlier check's.
+sessions_dir="${CONTINUE_GLOBAL_DIR:-$HOME/.continue}/sessions"
+sessions_before="/tmp/check-${name}.sessions-before"
 
 # A check that ends before its agent runs (below) has no check run yet;
 # report.sh creates it already completed.
@@ -122,7 +127,10 @@ run_agent() {
     render_args+=(--retry)
   elif [ "${1:-}" = "retry-empty" ]; then
     render_args+=(--retry-empty)
+  elif [ "${1:-}" = "repair" ]; then
+    render_args+=(--repair)
   fi
+  ls -1 "$sessions_dir" > "$sessions_before" 2>/dev/null || : > "$sessions_before"
   # install-deps.sh's results: which dependencies the agent can read.
   if [ -f /tmp/checks-deps.txt ]; then
     render_args+=(--deps /tmp/checks-deps.txt)
@@ -176,8 +184,41 @@ if [ -n "${CHECKS_MAX_COST:-}" ]; then
   fi
 fi
 
-# What an earlier run of this check cost, added to the reported usage.
+# What the earlier runs of this check cost, added to the reported usage.
 spent_before=0
+
+# The session the last agent run saved: the newest file that was not there
+# when it started. Empty for an agent that saves none.
+last_session() {
+  local file new=()
+  for file in "$sessions_dir"/*.json; do
+    [ -f "$file" ] || continue
+    case "$(basename "$file")" in sessions.json) continue ;; esac
+    grep -qxF "$(basename "$file")" "$sessions_before" 2>/dev/null && continue
+    new+=("$file")
+  done
+  if [ "${#new[@]}" -gt 0 ]; then
+    ls -t "${new[@]}" | head -n 1
+  fi
+}
+
+# The kind of each run of this check, oldest first, for the call table.
+run_kinds=(first)
+# What earlier runs answered and saved, kept as check-<name>.run<N>.json,
+# .err and .session.json before the next run overwrites the files.
+kept_files=()
+
+keep_run() {
+  local base="/tmp/check-${name}.run${#run_kinds[@]}"
+  local session
+  cp "$raw" "${base}.json" 2>/dev/null || true
+  cp "$err" "${base}.err" 2>/dev/null || true
+  session="$(last_session)"
+  if [ -n "$session" ]; then
+    cp "$session" "${base}.session.json"
+  fi
+  kept_files+=("${base}.json" "${base}.err" "${base}.session.json")
+}
 
 # Set when the agent finished normally (not at a limit), but its verdict has
 # no findings and did not finish, while the diff is non-empty. That is not a
@@ -211,19 +252,61 @@ judge_run() {
   return 0
 }
 
+# A repair is one model call over the whole review; the final calls of long
+# nextcli reviews took up to 100 seconds.
+MIN_REPAIR_SECONDS=120
+
+# A nextcli run that finished and wrote an answer with no verdict in it (JSON
+# with keys of its own, or text a provider cut off) has done its review. Ask
+# its own session once, with --fork, to write that review as the verdict: one
+# model call where a retry reviews the change again. Returns 1 when no repair
+# ran or it gave no verdict (or one that reviewed nothing), for the retries
+# below.
+repair_answer() {
+  local first_code="$1" session budget repair_max_cost=""
+  if [ "$agent" != "nextcli" ] || [ "$first_code" -ne 0 ] || [ ! -s "$raw" ]; then
+    return 1
+  fi
+  session="$(last_session)"
+  if [ -z "$session" ]; then
+    return 1
+  fi
+  if [ $((deadline - SECONDS)) -lt "$MIN_REPAIR_SECONDS" ]; then
+    echo "::notice::check/${name} answered without a verdict and has too little of its ${timeout_minutes} minutes left to ask for one."
+    return 1
+  fi
+  if [ -n "${CHECKS_MAX_COST:-}" ]; then
+    if ! budget="$(python3 "$script_dir/checks.py" retry-budget --stderr "$err" --max-cost "$CHECKS_MAX_COST")"; then
+      echo "::notice::check/${name} answered without a verdict and has too little of its \$${CHECKS_MAX_COST} cost limit left to ask for one."
+      return 1
+    fi
+    read -r repair_max_cost spent_before <<< "$budget"
+  fi
+  echo "::notice::check/${name} answered without a verdict; asking the same session to write its review as one."
+  keep_run
+  run_kinds+=(repair)
+  set +e
+  CHECKS_MAX_COST="$repair_max_cost" CHECKS_FORK_SESSION="$(basename "$session" .json)" run_agent repair
+  code=$?
+  set -e
+  judge_run "$code"
+}
+
 set +e
 run_agent
 code=$?
 set -e
 
 if ! judge_run "$code"; then
-  if [ "$review_was_empty" = true ]; then
-    # With a cost limit, the retry gets only what the first run left of it,
-    # so both runs together stay within the limit.
+  if [ "$review_was_empty" != true ] && repair_answer "$code"; then
+    : # The session wrote its review as a verdict.
+  elif [ "$review_was_empty" = true ]; then
+    # With a cost limit, the retry gets only what the earlier runs left of it,
+    # so all runs together stay within the limit.
     retry_max_cost=""
     retry_ok=true
     if [ -n "${CHECKS_MAX_COST:-}" ] && [ "$agent" = "nextcli" ]; then
-      if budget="$(python3 "$script_dir/checks.py" retry-budget --stderr "$err" --max-cost "$CHECKS_MAX_COST")"; then
+      if budget="$(python3 "$script_dir/checks.py" retry-budget --stderr "$err" --max-cost "$CHECKS_MAX_COST" --spent-before "$spent_before")"; then
         read -r retry_max_cost spent_before <<< "$budget"
       else
         retry_ok=false
@@ -233,6 +316,8 @@ if ! judge_run "$code"; then
     if [ "$retry_ok" != true ] || ! time_for_retry; then
       write_verdict INCOMPLETE "The agent did not review the diff."
     else
+      keep_run
+      run_kinds+=(retry)
       set +e
       if [ -n "$retry_max_cost" ]; then
         CHECKS_MAX_COST="$retry_max_cost" run_agent retry-empty
@@ -255,15 +340,19 @@ if ! judge_run "$code"; then
   elif ! time_for_retry; then
     write_error_verdict "The agent did not return a valid verdict."
   elif [ "$retry_allowed" = true ]; then
+    keep_run
+    run_kinds+=(retry)
     set +e
     run_agent retry
     code=$?
     set -e
     judge_run "$code" || write_error_verdict "The agent did not return a valid verdict."
   elif [ "$agent" = "nextcli" ] && [ "$code" -ne "$LIMIT_EXIT" ] &&
-    budget="$(python3 "$script_dir/checks.py" retry-budget --stderr "$err" --max-cost "$CHECKS_MAX_COST")"; then
+    budget="$(python3 "$script_dir/checks.py" retry-budget --stderr "$err" --max-cost "$CHECKS_MAX_COST" --spent-before "$spent_before")"; then
     read -r retry_max_cost spent_before <<< "$budget"
     echo "::notice::check/${name} gave no verdict; retrying with the \$${retry_max_cost} left of its \$${CHECKS_MAX_COST} cost limit."
+    keep_run
+    run_kinds+=(retry)
     set +e
     CHECKS_MAX_COST="$retry_max_cost" run_agent retry
     code=$?
@@ -278,27 +367,26 @@ limit_args=()
 if [ "$code" -eq "$LIMIT_EXIT" ]; then
   limit_args+=(--limit-exit)
 fi
-python3 "$script_dir/checks.py" annotate --verdict "$verdict_file" --stderr "$err" --spent-before "$spent_before" ${limit_args[@]+"${limit_args[@]}"}
+python3 "$script_dir/checks.py" annotate --verdict "$verdict_file" --stderr "$err" --answer "$raw" --spent-before "$spent_before" ${limit_args[@]+"${limit_args[@]}"}
 
 # NextCLI traces every model call (NEXTCLI_TRACE=basic). Keep that log and the
-# session (which tool calls returned what) with the results.
+# last run's session (which tool calls returned what) with the results.
 calls="/tmp/check-${name}.calls.jsonl"
 session_copy="/tmp/check-${name}.session.json"
 if [ "$agent" = "nextcli" ]; then
-  sessions_dir="${CONTINUE_GLOBAL_DIR:-$HOME/.continue}/sessions"
   cat "$trace_dir"/*.jsonl > "$calls" 2>/dev/null || rm -f "$calls"
-  newest="$(ls -t "$sessions_dir"/*.json 2>/dev/null | grep -v '/sessions\.json$' | head -n 1 || true)"
-  if [ -n "$newest" ]; then
-    cp "$newest" "$session_copy"
+  session="$(last_session)"
+  if [ -n "$session" ]; then
+    cp "$session" "$session_copy"
   fi
 fi
 
 # Nothing the agent wrote is posted or uploaded until secrets are removed.
-python3 "$script_dir/checks.py" redact "$verdict_file" "$raw" "$err" "$prompt" "$calls" "$session_copy"
+python3 "$script_dir/checks.py" redact "$verdict_file" "$raw" "$err" "$prompt" "$calls" "$session_copy" ${kept_files[@]+"${kept_files[@]}"}
 bash "$script_dir/report.sh" "$name" "$verdict_file" "$check_run_id"
 
 if [ -s "$calls" ]; then
   echo "::group::check/${name}: model calls"
-  python3 "$script_dir/checks.py" session-report --calls "$calls" --session "$session_copy" || true
+  python3 "$script_dir/checks.py" session-report --calls "$calls" --session "$session_copy" --kinds "$(IFS=,; echo "${run_kinds[*]}")" || true
   echo "::endgroup::"
 fi
