@@ -52,6 +52,11 @@ Kept for 7 days, already redacted:
   (exit 3) and its verdict was kept. Sum `cost` in `calls.jsonl`. A retry only
   gets what the first run left of the budget (`checks.py retry-budget`), and
   starts only with a third of the time left.
+- **ERROR "0 prompt tokens" / "did not pass the check to the model".** The
+  provider answered in the model's place (a gateway that blocked the runner's
+  network). The check already ran again after 30, 60 and 120 s; each earlier
+  run is kept as `check-<name>.run<N>.json`, `.err` and `.session.json`. Re-run
+  the job once the provider works again.
 - **ERROR about provider or configuration.** Exit 2. Check the `provider`,
   `model`, `base-url` inputs and the repository variables they come from.
 - **A finding about code that is there.** Compare `gh pr diff <N> | wc -c`
