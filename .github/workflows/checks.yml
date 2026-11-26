@@ -37,9 +37,9 @@ on:
         type: string
         required: true
       agent:
-        description: opencode (default), nextcli, or claude-code
+        description: nextcli (default), opencode, or claude-code. Only nextcli enforces the cost, turn and time limits.
         type: string
-        default: opencode
+        default: nextcli
       agent-version:
         description: Version of the agent CLI. Empty for the action's default.
         type: string

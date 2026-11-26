@@ -359,6 +359,9 @@ class InstallAgentTest(unittest.TestCase):
             "CHECKS_NEXTCLI_SRC_DIR": str(self.src),
             **env,
         }
+        # CHECKS_AGENT=None leaves it unset, to exercise the script's default.
+        if full_env.get("CHECKS_AGENT") is None:
+            full_env.pop("CHECKS_AGENT", None)
         result = subprocess.run(
             ["bash", str(INSTALL_SCRIPT)], env=full_env, capture_output=True, text=True
         )
@@ -369,6 +372,17 @@ class InstallAgentTest(unittest.TestCase):
         result, calls = self.run_install()
         self.assertEqual(calls, [f"npm install -g @nextcli/cli@{self.DEFAULT_NEXTCLI}"])
         self.assertEqual(result.stdout.strip(), self.DEFAULT_NEXTCLI)
+
+    def test_an_unset_agent_installs_nextcli(self):
+        # The default agent is nextcli: only it enforces the cost, turn and
+        # time limits. An unset or empty CHECKS_AGENT must install cn.
+        for unset in (None, ""):
+            with self.subTest(checks_agent=unset):
+                result, calls = self.run_install(CHECKS_AGENT=unset)
+                self.assertEqual(
+                    calls, [f"npm install -g @nextcli/cli@{self.DEFAULT_NEXTCLI}"]
+                )
+                self.assertEqual(result.stdout.strip(), self.DEFAULT_NEXTCLI)
 
     def test_agent_version_pins_nextcli(self):
         _, calls = self.run_install(CHECKS_AGENT_VERSION="0.2.0")
@@ -2411,6 +2425,84 @@ class AgentProjectConfigTest(unittest.TestCase):
         self.assertIn("OPENCODE_DISABLE_CLAUDE_CODE=1", lines)
         # Its own configuration still arrives
         self.assertTrue(any(line.startswith("OPENCODE_CONFIG_CONTENT=") for line in lines))
+
+
+class DefaultAgentDispatchTest(unittest.TestCase):
+    """run-checks.sh runs the nextcli adapter when CHECKS_AGENT is unset or empty."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.scripts = root / "scripts"
+        shutil.copytree(
+            Path(__file__).parent, self.scripts,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+        self.checks = root / "checks"
+        self.checks.mkdir()
+        (self.checks / "review.md").write_text(
+            "---\nname: Review\ndescription: x\n---\nReview.\n"
+        )
+        self.dispatch = root / "dispatch"
+        # Replace every adapter with a stub that records which one was chosen
+        # and answers a complete verdict, so run-check.sh runs it exactly once.
+        verdict = json.dumps(
+            {"verdict": "PASS", "summary": "ok", "complete": True, "findings": []}
+        )
+        for agent in ("nextcli", "opencode", "claude-code"):
+            (self.scripts / "agents" / f"{agent}.sh").write_text(
+                f"#!/usr/bin/env bash\necho {agent} >> '{self.dispatch}'\n"
+                f"printf '%s' '{verdict}'\n"
+            )
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        # GNU timeout isn't on macOS; the stub doesn't wait.
+        timeout = self.bin / "timeout"
+        timeout.write_text('#!/usr/bin/env bash\nshift\nexec "$@"\n')
+        timeout.chmod(0o755)
+        Path("/tmp/pr-truncated.diff").write_text("diff --git a/a b/a\n")
+        # run-checks.sh neutralizes the working directory: run it in an empty
+        # one, so it never moves this repository's own .claude/ or .env files.
+        self.work = root / "work"
+        self.work.mkdir()
+        # neutralize-pr-config.sh moves anything it finds here, out of /tmp.
+        self.neutralized = root / "moved-config"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        for path in Path("/tmp").glob("check-review.*"):
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        Path("/tmp/pr-truncated.diff").unlink(missing_ok=True)
+
+    def run_checks(self, agent):
+        env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.tmp.name),
+            "CHECKS_DIR": str(self.checks),
+            "CHECKS_PROVIDER": "openai-compatible",
+            "CHECKS_MODEL": "m",
+            "RUNNER_TEMP": str(self.neutralized),
+        }
+        if agent is not None:
+            env["CHECKS_AGENT"] = agent
+        result = subprocess.run(
+            ["bash", str(self.scripts / "run-checks.sh")],
+            env=env, cwd=self.work, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.dispatch.read_text().split()
+
+    def test_an_unset_or_empty_agent_runs_nextcli(self):
+        for unset in (None, ""):
+            with self.subTest(checks_agent=unset):
+                self.dispatch.write_text("")
+                self.assertEqual(self.run_checks(unset), ["nextcli"])
+
+    def test_an_explicit_agent_is_still_honored(self):
+        self.assertEqual(self.run_checks("opencode"), ["opencode"])
 
 
 if __name__ == "__main__":

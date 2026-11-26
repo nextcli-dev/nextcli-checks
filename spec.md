@@ -314,7 +314,7 @@ You need five things:
 
 1. **Trigger**: PR opened, updated, or reopened
 2. **Discovery**: find all check files in the checks directory
-3. **Agent runtime**: run each check as a read-only AI agent with the PR diff as context. The runtime is pluggable (`opencode` by default, `nextcli`, or `claude-code`) and is configured with a provider, model, API key, and optional base URL rather than a single vendor's environment variable.
+3. **Agent runtime**: run each check as a read-only AI agent with the PR diff as context. The runtime is pluggable (`nextcli` by default, `opencode`, or `claude-code`) and is configured with a provider, model, API key, and optional base URL rather than a single vendor's environment variable.
 4. **Verdict parser**: extract pass/fail and reasoning from agent output
 5. **Status reporter**: post results as GitHub status checks
 
@@ -322,7 +322,7 @@ You need five things:
 
 The runner is the composite action in [`action.yml`](./action.yml). A caller passes `provider`, `model`, `api-key` (the `PROVIDER_API_KEY` secret), and an optional `base-url`. Named providers are `anthropic`, `openai`, `deepseek`, and `openrouter`. `openai-compatible` is any OpenAI-compatible gateway (oneprovider.dev, LiteLLM, vLLM) and requires `base-url`.
 
-`agent` defaults to opencode. `nextcli` writes a temporary NextCLI `config.yaml` (see `scripts/agents/nextcli.sh`) and runs `cn -p --readonly --config <file>`. `claude-code` only supports Anthropic-compatible endpoints (`anthropic`, `openrouter`, and `deepseek`) and fails that check with a clear error for any other provider.
+`agent` defaults to nextcli, the only agent that enforces the per-check cost, turn and time limits; `opencode` and `claude-code` ignore them. `nextcli` writes a temporary NextCLI `config.yaml` (see `scripts/agents/nextcli.sh`) and runs `cn -p --readonly --config <file>`. `claude-code` only supports Anthropic-compatible endpoints (`anthropic`, `openrouter`, and `deepseek`) and fails that check with a clear error for any other provider.
 
 The workflow in [`.github/workflows/checks.yml`](./.github/workflows/checks.yml) is the parallel form: one job per check file, with the agent install cached. A one-step workflow that runs every check in a single job is in the README. Each check completes a status check. One pull request comment, edited in place, holds every result: verdict, summary, and findings that link to the file and line. There are no inline suggestion comments.
 
