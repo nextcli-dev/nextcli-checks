@@ -69,7 +69,7 @@ Before opening a pull request, run all checks in `.checks/` against the current 
 
 ## Run in CI
 
-Call the reusable workflow. It lists the checks, then runs each one as its own job, in parallel. Each check reports as a check run named `check/<name>`. One pull request comment, updated in place, holds every check: the verdict, a summary, and findings that link to the file and line. A run that stops at its limit is marked as a partial review. The agent is read-only: it can read files and run a short list of read-only commands, and it cannot edit the checkout.
+Call the reusable workflow. It lists the checks, then runs each one as its own job, in parallel. Each check reports as a check run named `check/<name>`. One pull request comment, updated in place, holds every check: the verdict, a summary, and findings that link to the file and line. A run that stops at its limit is marked as a partial review. The agent is read-only and cannot edit the checkout. The default `nextcli` agent reads, searches and lists files, with no shell; `opencode` also runs a short list of read-only commands, and `claude-code` runs in plan mode.
 
 ```yaml
 name: AI Checks
@@ -84,6 +84,7 @@ jobs:
       pull-requests: write
       checks: write
     with:
+      agent: ${{ vars.CHECKS_AGENT || 'nextcli' }}
       provider: ${{ vars.CHECKS_PROVIDER }}
       model: ${{ vars.CHECKS_MODEL }}
       base-url: ${{ vars.CHECKS_BASE_URL }}
@@ -119,7 +120,7 @@ How it runs:
 - With `agent: nextcli`, each check's results also hold `check-<name>.calls.jsonl`, NextCLI's `NEXTCLI_TRACE=basic` trace (one line per model call: tokens, cost, seconds, finish reason, answer and reasoning length, tools asked for, and the provider's error message for a failed call; no prompt or answer text), and `check-<name>.session.json` (the conversation of the last run, with what each tool returned). When a check ran more than once, the answer, stderr and session of each earlier run are kept as `check-<name>.run<N>.json`, `.err` and `.session.json`. A version of `cn` without tracing writes no trace, and the call table is skipped. The job log prints a per-call table for each run of the check (the first run, a rerun after a provider refusal, a repair, a retry), with a line on how a run ended when its last call gave no answer; run it yourself with `python3 scripts/checks.py session-report --calls check-review.calls.jsonl --session check-review.session.json`. The session files can contain the reviewed code and the agent's reasoning.
 - A check run left unfinished by a cancelled or timed-out job is completed as `neutral`. A later run edits the same pull request comment. An earlier v2 "changes requested" review is dismissed.
 
-The workflow is not tied to one vendor. You pass a provider, a model, an API key, and an optional base URL. `agent` defaults to [opencode](https://opencode.ai). `nextcli` uses the NextCLI `cn` CLI. `claude-code` only supports Anthropic-compatible endpoints (`anthropic`, `openrouter`, and `deepseek`).
+The workflow is not tied to one vendor. You pass a provider, a model, an API key, and an optional base URL. `agent` defaults to `nextcli`, the NextCLI `cn` CLI, because it is the only one that enforces the per-check cost, turn and time limits (`max-cost`, `max-turns`, `--max-time`); the other agents print a notice and run without them. [opencode](https://opencode.ai) and `claude-code` remain available; `claude-code` only supports Anthropic-compatible endpoints (`anthropic`, `openrouter`, and `deepseek`).
 
 | Provider | `provider` | `base-url` |
 | --- | --- | --- |
@@ -138,7 +139,7 @@ gh variable set CHECKS_BASE_URL --repo owner/repo --body "https://api.oneprovide
 gh secret set PROVIDER_API_KEY --repo owner/repo
 ```
 
-Leave `base-url` empty for a named provider unless you need a gateway. Set `CHECKS_AGENT` and pass `agent: ${{ vars.CHECKS_AGENT }}` only when you are not using the default `opencode`.
+Leave `base-url` empty for a named provider unless you need a gateway. The example passes `agent: ${{ vars.CHECKS_AGENT || 'nextcli' }}`, so an unset `CHECKS_AGENT` selects `nextcli` on the current `v3` tag as well. Set `CHECKS_AGENT` only when you want another agent (for example `opencode`).
 
 ### Inputs
 
@@ -146,7 +147,7 @@ The reusable workflow takes `provider`, `model`, `agent`, `agent-version`, `max-
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `agent` | `opencode` | Agent CLI that runs each check: `opencode`, `nextcli`, or `claude-code`. |
+| `agent` | `nextcli` | Agent CLI that runs each check: `nextcli`, `opencode`, or `claude-code`. Only `nextcli` enforces `max-cost`, `max-turns` and the time limit; the others ignore them. |
 | `agent-version` | empty | Version of the agent CLI to install. Defaults to `opencode-ai` 1.19.5, `@anthropic-ai/claude-code` 2.1.312, or `@nextcli/cli` 0.13.0. An installed `cn` at another version is replaced. |
 | `max-cost` | `1` | Dollar cap per check. `nextcli` stops at the cap and still returns a result; the comment marks that review partial. Other agents ignore it. The comment shows each cost with where its prices came from: no note for the host's exact price, `catalog price` for the host's list price in NextCLI's models.dev snapshot, `estimated` otherwise, and the snapshot's date when one was used. |
 | `max-output-tokens` | empty | Output tokens one model call may produce, thinking included (`nextcli` only). Empty uses the provider's default, which is 4,096 on DeepSeek and can be used up by thinking before the answer. |

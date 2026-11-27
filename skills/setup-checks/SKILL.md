@@ -1,7 +1,7 @@
 ---
 name: setup-checks
 description: Creates tailored pull-request review checks as markdown. Use when adding checks that need judgment. Do not use for lint rules or unit tests.
-version: 1.1.0
+version: 1.2.0
 metadata:
   author: NextCLI contributors <nextcli-dev@users.noreply.github.com>
   tags:
@@ -14,7 +14,7 @@ metadata:
 
 These checks come from [NextCLI Checks](https://github.com/nextcli-dev/nextcli-checks). Install them with `npx skills@1.7.4 add nextcli-dev/nextcli-checks`.
 
-You are helping a developer set up **AI Checks**: markdown files that define code quality standards. Each check runs as an agent on every pull request. The agent can read files and run read-only commands. If it finds something, it fails the pull request with a suggested fix. Otherwise it passes silently.
+You are helping a developer set up **AI Checks**: markdown files that define code quality standards. Each check runs as an agent on every pull request. The default `nextcli` agent reads, searches and lists files, with no shell; `opencode` also runs a short list of read-only commands, and `claude-code` runs in plan mode. One pull request comment holds every result: the verdict, a summary, and findings that link to the file and line. There are no inline suggestion comments.
 
 ## Purpose
 
@@ -200,7 +200,7 @@ If they say yes, ask which provider, model, and agent to use:
 - **provider** (required): `anthropic`, `openai`, `deepseek`, `openrouter`, or `openai-compatible`
 - **model** (required): the model id, such as `claude-sonnet-4-5` or `deepseek-v4-pro`
 - **base URL**: required for `openai-compatible` (an OpenAI-compatible gateway root, for example `https://gateway.example.com/v1`). Optional for the named providers.
-- **agent**: `opencode` (default), `nextcli`, or `claude-code`. `claude-code` only supports `anthropic`, `openrouter`, and `deepseek`. If they pick `claude-code` with another provider, say so and ask them to pick again.
+- **agent**: `nextcli` (default), `opencode`, or `claude-code`. Recommend `nextcli`: it is the only agent that enforces the per-check cost, turn and time limits. `claude-code` only supports `anthropic`, `openrouter`, and `deepseek`. If they pick `claude-code` with another provider, say so and ask them to pick again.
 
 Create the workflow file checks.yml in the repository's GitHub workflows directory:
 
@@ -217,12 +217,13 @@ concurrency:
 
 jobs:
   ai-checks:
-    uses: nextcli-dev/nextcli-checks/.github/workflows/checks.yml@v2
+    uses: nextcli-dev/nextcli-checks/.github/workflows/checks.yml@v3
     permissions:
       contents: read
       pull-requests: write
       checks: write
     with:
+      agent: ${{ vars.CHECKS_AGENT || 'nextcli' }}
       provider: ${{ vars.CHECKS_PROVIDER }}
       model: ${{ vars.CHECKS_MODEL }}
       base-url: ${{ vars.CHECKS_BASE_URL }}
@@ -230,9 +231,9 @@ jobs:
       api-key: ${{ secrets.PROVIDER_API_KEY }}
 ```
 
-When the agent is not `opencode`, add `agent: ${{ vars.CHECKS_AGENT }}` under `with:`.
+That `agent` line selects `nextcli` when `CHECKS_AGENT` is unset, including on a `v3` tag that still defaults to `opencode`. Set `CHECKS_AGENT` to `opencode` or `claude-code` only when they want that agent.
 
-The workflow runs each file in `.checks/` as its own parallel job with a read-only agent, and posts one GitHub check run per file. A passing check is silent. A failing check opens a review with committable suggestion comments. Fork pull requests are skipped because they cannot read repository secrets. Checks are read from the pull request's base commit, so the new `.checks/` files only run on pull requests opened after they are merged.
+The workflow runs each file in `.checks/` as its own parallel job with a read-only agent, and posts one GitHub check run per file. One pull request comment, edited in place, holds every result: the verdict, a summary, and findings that link to the file and line. There are no inline suggestion comments. Fork pull requests are skipped because they cannot read repository secrets. Checks are read from the pull request's base commit, so the new `.checks/` files only run on pull requests opened after they are merged.
 
 Tell the user to run the following in their terminal. Fill in `<owner>/<repo>` and the values they chose. **Do not run the secret command yourself. Do not put the API key in the command, in the workflow, or in chat.**
 
@@ -244,7 +245,7 @@ gh variable set CHECKS_AGENT --repo <owner>/<repo> --body "<agent>"
 gh secret set PROVIDER_API_KEY --repo <owner>/<repo>
 ```
 
-Omit `CHECKS_BASE_URL` when they did not set a base URL. Omit `CHECKS_AGENT` when they kept the default `opencode`. `gh secret set` prompts for the key, so the key is not written to shell history.
+Omit `CHECKS_BASE_URL` when they did not set a base URL. Omit `CHECKS_AGENT` when they kept the default `nextcli`. `gh secret set` prompts for the key, so the key is not written to shell history.
 
 Get `<owner>/<repo>` from `gh repo view --json nameWithOwner --jq .nameWithOwner`.
 

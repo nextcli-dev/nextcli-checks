@@ -6,12 +6,12 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=retry-gh.sh
 source "$script_dir/retry-gh.sh"
 checks_dir="${CHECKS_DIR:-.checks}"
-agent="${CHECKS_AGENT:-opencode}"
+agent="${CHECKS_AGENT:-nextcli}"
 
 case "$agent" in
-  opencode|nextcli|claude-code) ;;
+  nextcli|opencode|claude-code) ;;
   *)
-    echo "Unknown agent '${agent}'. Use opencode, nextcli, or claude-code." >&2
+    echo "Unknown agent '${agent}'. Use nextcli, opencode, or claude-code." >&2
     exit 1
     ;;
 esac

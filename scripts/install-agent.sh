@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Install the selected agent CLI. Empty CHECKS_AGENT means opencode.
+# Install the selected agent CLI. Empty CHECKS_AGENT means nextcli.
 set -euo pipefail
 
-agent="${CHECKS_AGENT:-opencode}"
+agent="${CHECKS_AGENT:-nextcli}"
 version="${CHECKS_AGENT_VERSION:-}"
 
 case "$agent" in
@@ -62,7 +62,7 @@ case "$agent" in
     cn --version
     ;;
   *)
-    echo "Unknown agent '${agent}'. Use opencode, nextcli, or claude-code." >&2
+    echo "Unknown agent '${agent}'. Use nextcli, opencode, or claude-code." >&2
     exit 1
     ;;
 esac

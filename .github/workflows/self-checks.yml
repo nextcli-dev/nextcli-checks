@@ -35,7 +35,7 @@ jobs:
       pull-requests: write
       checks: write
     with:
-      agent: ${{ vars.CHECKS_AGENT || 'opencode' }}
+      agent: ${{ vars.CHECKS_AGENT || 'nextcli' }}
       provider: ${{ vars.CHECKS_PROVIDER }}
       model: ${{ vars.CHECKS_MODEL }}
       base-url: ${{ vars.CHECKS_BASE_URL }}

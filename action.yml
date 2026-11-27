@@ -16,9 +16,9 @@ inputs:
     required: false
     default: ""
   agent:
-    description: Agent CLI that runs each check. opencode (default), nextcli, or claude-code. claude-code only supports anthropic, openrouter, and deepseek.
+    description: Agent CLI that runs each check. nextcli (default), opencode, or claude-code. Only nextcli enforces max-cost, max-turns and the time limit; opencode and claude-code ignore them. claude-code only supports anthropic, openrouter, and deepseek.
     required: false
-    default: opencode
+    default: nextcli
   agent-version:
     description: Version of the agent CLI to install. Defaults to opencode-ai 1.19.5, @anthropic-ai/claude-code 2.1.312, or @nextcli/cli 0.13.0. Ignored for nextcli when nextcli-ref is set.
     required: false

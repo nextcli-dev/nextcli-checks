@@ -22,7 +22,7 @@ if [ ! -f "$check_file" ]; then
 fi
 
 name="$(basename "$check_file" .md)"
-agent="${CHECKS_AGENT:-opencode}"
+agent="${CHECKS_AGENT:-nextcli}"
 provider="${CHECKS_PROVIDER:-}"
 model="${CHECKS_MODEL:-}"
 timeout_minutes="${CHECKS_TIMEOUT:-10}"
