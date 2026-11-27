@@ -84,6 +84,7 @@ jobs:
       pull-requests: write
       checks: write
     with:
+      agent: ${{ vars.CHECKS_AGENT || 'nextcli' }}
       provider: ${{ vars.CHECKS_PROVIDER }}
       model: ${{ vars.CHECKS_MODEL }}
       base-url: ${{ vars.CHECKS_BASE_URL }}
@@ -138,7 +139,7 @@ gh variable set CHECKS_BASE_URL --repo owner/repo --body "https://api.oneprovide
 gh secret set PROVIDER_API_KEY --repo owner/repo
 ```
 
-Leave `base-url` empty for a named provider unless you need a gateway. Set `CHECKS_AGENT` and pass `agent: ${{ vars.CHECKS_AGENT }}` only when you want an agent other than the default `nextcli` (for example `opencode`).
+Leave `base-url` empty for a named provider unless you need a gateway. The example passes `agent: ${{ vars.CHECKS_AGENT || 'nextcli' }}`, so an unset `CHECKS_AGENT` selects `nextcli` on the current `v3` tag as well. Set `CHECKS_AGENT` only when you want another agent (for example `opencode`).
 
 ### Inputs
 

@@ -11,6 +11,7 @@
 #         pull-requests: write
 #         checks: write
 #       with:
+#         agent: ${{ vars.CHECKS_AGENT || 'nextcli' }}
 #         provider: ${{ vars.CHECKS_PROVIDER }}
 #         model: ${{ vars.CHECKS_MODEL }}
 #       secrets:

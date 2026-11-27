@@ -14,7 +14,7 @@ metadata:
 
 These checks come from [NextCLI Checks](https://github.com/nextcli-dev/nextcli-checks). Install them with `npx skills@1.7.4 add nextcli-dev/nextcli-checks`.
 
-You are helping a developer set up **AI Checks**: markdown files that define code quality standards. Each check runs as an agent on every pull request. The agent can read files and run read-only commands. If it finds something, it fails the pull request with a suggested fix. Otherwise it passes silently.
+You are helping a developer set up **AI Checks**: markdown files that define code quality standards. Each check runs as an agent on every pull request. The default `nextcli` agent reads, searches and lists files, with no shell; `opencode` also runs a short list of read-only commands, and `claude-code` runs in plan mode. One pull request comment holds every result: the verdict, a summary, and findings that link to the file and line. There are no inline suggestion comments.
 
 ## Purpose
 
@@ -223,6 +223,7 @@ jobs:
       pull-requests: write
       checks: write
     with:
+      agent: ${{ vars.CHECKS_AGENT || 'nextcli' }}
       provider: ${{ vars.CHECKS_PROVIDER }}
       model: ${{ vars.CHECKS_MODEL }}
       base-url: ${{ vars.CHECKS_BASE_URL }}
@@ -230,9 +231,9 @@ jobs:
       api-key: ${{ secrets.PROVIDER_API_KEY }}
 ```
 
-When the agent is not `nextcli`, add `agent: ${{ vars.CHECKS_AGENT }}` under `with:`.
+That `agent` line selects `nextcli` when `CHECKS_AGENT` is unset, including on a `v3` tag that still defaults to `opencode`. Set `CHECKS_AGENT` to `opencode` or `claude-code` only when they want that agent.
 
-The workflow runs each file in `.checks/` as its own parallel job with a read-only agent, and posts one GitHub check run per file. A passing check is silent. A failing check opens a review with committable suggestion comments. Fork pull requests are skipped because they cannot read repository secrets. Checks are read from the pull request's base commit, so the new `.checks/` files only run on pull requests opened after they are merged.
+The workflow runs each file in `.checks/` as its own parallel job with a read-only agent, and posts one GitHub check run per file. One pull request comment, edited in place, holds every result: the verdict, a summary, and findings that link to the file and line. There are no inline suggestion comments. Fork pull requests are skipped because they cannot read repository secrets. Checks are read from the pull request's base commit, so the new `.checks/` files only run on pull requests opened after they are merged.
 
 Tell the user to run the following in their terminal. Fill in `<owner>/<repo>` and the values they chose. **Do not run the secret command yourself. Do not put the API key in the command, in the workflow, or in chat.**
 
